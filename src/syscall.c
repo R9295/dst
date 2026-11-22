@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "dethv_guest.h"
 #include "syscalls.h"
 #include <asm/prctl.h>
 #include <errno.h>
@@ -163,6 +164,99 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
     uint64_t a4 = r->r10;
     uint64_t a5 = r->r8;
     uint64_t a6 = r->r9;
+
+    /* ==================== DetHV Guest Hypercalls (0x44455400..0x44455404) ==================== */
+    if (nr >= DETHV_HC_PING && nr <= DETHV_HC_PANIC) {
+        switch (nr) {
+            case DETHV_HC_PING:
+                r->rax = DETHV_HC_MAGIC;
+                return;
+
+            case DETHV_HC_GET_INPUT: {
+                uint64_t buf_va  = a1;
+                size_t   max_len = (size_t)a2;
+                uint64_t flags   = a3;
+
+                vm->hc_input_vaddr   = buf_va;
+                vm->hc_input_max_len = max_len;
+
+                if (vm->snap_on_hc_armed && !(flags & DETHV_HC_FLAG_NO_SNAP)) {
+                    vm->snap_on_hc_armed = false;
+                    r->rip -= 2; /* Rewind onto `syscall` so snapshot restore re-executes! */
+                    vm->running = false;
+                    vm->stop_reason = DETHV_STOP_SNAPSHOT;
+                    return;
+                }
+
+                vm->det.syscall_count++;
+                cur->last_sys = nr;
+                det_advance_time(&vm->det, 1000);
+                vm->shared->vtsc += DETHV_VTSC_STEP_SYSCALL;
+
+                const uint8_t *src = vm->hc_input_set ? vm->hc_input_buf : vm->vfs.stdin_buf;
+                size_t total_len   = vm->hc_input_set ? vm->hc_input_len : vm->vfs.stdin_len;
+                if (flags & DETHV_HC_FLAG_REWIND) vm->hc_input_pos = 0;
+                size_t rem = (vm->hc_input_pos < total_len) ? (total_len - vm->hc_input_pos) : 0;
+
+                int64_t hc_ret;
+                if (buf_va == 0 && max_len == 0) {
+                    hc_ret = (int64_t)rem;
+                } else {
+                    size_t n = rem < max_len ? rem : max_len;
+                    if (n > 0 && src) {
+                        if (mmu_copy_to_guest(vm, buf_va, src + vm->hc_input_pos, n) < 0) {
+                            hc_ret = -EFAULT;
+                        } else {
+                            if (!(flags & DETHV_HC_FLAG_PEEK)) vm->hc_input_pos += n;
+                            hc_ret = (int64_t)n;
+                        }
+                    } else {
+                        hc_ret = 0;
+                    }
+                }
+                r->rax = (uint64_t)hc_ret;
+                return;
+            }
+
+            case DETHV_HC_SNAPSHOT:
+                if (vm->snap_on_hc_armed) {
+                    vm->snap_on_hc_armed = false;
+                    r->rax = 1; /* Guest sees return value 1 upon snapshot restore */
+                    vm->running = false;
+                    vm->stop_reason = DETHV_STOP_SNAPSHOT;
+                    return;
+                }
+                r->rax = 0;
+                return;
+
+            case DETHV_HC_DONE:
+                vm->det.syscall_count++;
+                cur->last_sys   = nr;
+                vm->exit_code   = (int)a1;
+                vm->stop_reason = DETHV_STOP_EXITED;
+                vm->running     = false;
+                return;
+
+            case DETHV_HC_PANIC:
+                vm->det.syscall_count++;
+                cur->last_sys = nr;
+                if (a2 != 0 && a3 > 0) {
+                    size_t mlen = (size_t)a3;
+                    if (mlen > 1024) mlen = 1024;
+                    char msg[1025];
+                    if (mmu_copy_from_guest(vm, msg, a2, mlen) == 0) {
+                        vfs_write(vm, 2, msg, mlen);
+                        if (msg[mlen - 1] != '\n') vfs_write(vm, 2, "\n", 1);
+                    }
+                }
+                vm->crash_signal = SIGABRT;
+                vm->fault_rip    = r->rip - 2;
+                vm->fault_addr   = a1;
+                vm->stop_reason  = DETHV_STOP_CRASH_ABRT;
+                vm->running      = false;
+                return;
+        }
+    }
 
     if (vm->snap_on_stdin_armed && nr == LINUX_SYS_read && (int)a1 == 0) {
         vm->snap_on_stdin_armed = false;

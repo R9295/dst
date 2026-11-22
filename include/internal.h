@@ -548,6 +548,17 @@ struct dethv_vm {
     bool                   snap_on_stdin_armed;
     char                   snap_on_open_substr[128];
     bool                   snap_on_open_armed;
+    bool                   snap_on_hc;
+    bool                   snap_on_hc_armed;
+
+    /* Hypercall fuzzing input buffer (DETHV_HC_GET_INPUT) */
+    uint8_t               *hc_input_buf;
+    size_t                 hc_input_len;
+    size_t                 hc_input_cap;
+    size_t                 hc_input_pos;
+    bool                   hc_input_set;
+    uint64_t               hc_input_vaddr;
+    size_t                 hc_input_max_len;
 
     /* Run status */
     bool                   running;

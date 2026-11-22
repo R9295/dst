@@ -88,4 +88,41 @@ echo "================================================================"
 $DETHV --snap-on-stdin --fuzz 100000 --fuzz-seed 0x1337 --fuzz-max-len 16 ./build/fuzz_target_dyn
 
 echo ""
+echo "================================================================"
+echo "10. Hypercall dethv_get_input() Auto-Snapshot & Disk Reload"
+echo "================================================================"
+# Native Linux safely returns -ENOSYS from DETHV_HC_PING and falls back to stdin
+NATIVE_OUT=$(printf "HELLO" | ./build/fuzz_hc_target_dyn)
+echo "  Native Linux fallback: $NATIVE_OUT"
+HC_SNAP="./build/test_hc_snap.dhvs"
+rm -f "$HC_SNAP"
+# Auto-snapshot at dethv_get_input() and save to disk!
+$DETHV --save-snap "$HC_SNAP" --input-str "HELLO_HC" --stats ./build/fuzz_hc_target_dyn
+# Reload saved hypercall snapshot and inject a crashing input ("DF!B") -> SIGSEGV
+set +e
+$DETHV --load-snap "$HC_SNAP" --input-str "DF!B" --stats 2>&1 | tee ./build/dethv_hc_segv.log
+SEGV_RC=${PIPESTATUS[0]}
+$DETHV --load-snap "$HC_SNAP" --input-str "DP!!" --stats 2>&1 | tee ./build/dethv_hc_panic.log
+PANIC_RC=${PIPESTATUS[0]}
+set -e
+grep -q "stop=CRASH_SIGSEGV" ./build/dethv_hc_segv.log
+grep -q "stop=CRASH_SIGABRT" ./build/dethv_hc_panic.log
+grep -q "cr2=0xbad1" ./build/dethv_hc_panic.log
+rm -f ./build/dethv_hc_segv.log ./build/dethv_hc_panic.log
+echo "  -> Confirmed: Auto-snapshot at dethv_get_input() + disk reload + dethv_panic() work!"
+
+echo ""
+echo "================================================================"
+echo "11. Hypercall Snapshot Reload Benchmark (50,000 resets)"
+echo "================================================================"
+$DETHV --input-str "HELLO_WORLD" --bench-snap 50000 ./build/fuzz_hc_target_dyn
+$DETHV --input-str "HELLO_WORLD" --bench-snap 50000 ./build/fuzz_hc_target_static
+
+echo ""
+echo "================================================================"
+echo "12. Hypercall Auto-Snapshot Fuzzing (100k execs, finds all 4 bugs)"
+echo "================================================================"
+$DETHV --fuzz 100000 --fuzz-seed 0x1337 --fuzz-max-len 16 ./build/fuzz_hc_target_dyn
+
+echo ""
 echo "ALL TESTS PASSED!"

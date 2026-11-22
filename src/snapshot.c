@@ -275,6 +275,8 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         vm->sregs_dirty         = false;
         vm->snap_on_stdin_armed = false;
         vm->snap_on_open_armed  = false;
+        vm->snap_on_hc_armed    = false;
+        vm->hc_input_pos        = 0;
 
         if (vfs_restore_fast(&vm->vfs, &snap->vfs) < 0) return -1;
     } else {
@@ -312,6 +314,8 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         vm->sregs_dirty     = false;
         vm->snap_on_stdin_armed = false;
         vm->snap_on_open_armed  = false;
+        vm->snap_on_hc_armed    = false;
+        vm->hc_input_pos        = 0;
 
         if (vfs_clone(&vm->vfs, &snap->vfs) < 0) return -1;
     }

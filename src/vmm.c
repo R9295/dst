@@ -468,6 +468,7 @@ void dethv_destroy(dethv_vm_t *vm) {
     net_destroy(&vm->net);
     vfs_destroy(&vm->vfs);
     x86_patch_destroy(&vm->patches);
+    free(vm->hc_input_buf);
     free(vm->host_dirty_bitmap);
     free(vm->phys_free_list);
     if (vm->dirty_ring) munmap(vm->dirty_ring, DETHV_DIRTY_RING_BYTES);
@@ -498,6 +499,34 @@ void dethv_set_snapshot_on_open(dethv_vm_t *vm, const char *path_substr) {
         vm->snap_on_open_substr[0] = '\0';
         vm->snap_on_open_armed = false;
     }
+}
+
+void dethv_set_snapshot_on_hc(dethv_vm_t *vm, bool enable) {
+    vm->snap_on_hc = enable;
+    vm->snap_on_hc_armed = enable;
+}
+
+int dethv_set_input(dethv_vm_t *vm, const void *data, size_t len) {
+    vm->hc_input_len = 0;
+    vm->hc_input_pos = 0;
+    vm->hc_input_set = true;
+    if (len > 0 && data) {
+        if (len > vm->hc_input_cap || !vm->hc_input_buf) {
+            size_t ncap = len < 256 ? 256 : len;
+            uint8_t *nb = realloc(vm->hc_input_buf, ncap);
+            if (!nb) return -1;
+            vm->hc_input_buf = nb;
+            vm->hc_input_cap = ncap;
+        }
+        memcpy(vm->hc_input_buf, data, len);
+        vm->hc_input_len = len;
+    }
+    return 0;
+}
+
+void dethv_get_input_info(const dethv_vm_t *vm, uint64_t *guest_buf_vaddr, size_t *guest_max_len) {
+    if (guest_buf_vaddr) *guest_buf_vaddr = vm->hc_input_vaddr;
+    if (guest_max_len)   *guest_max_len   = vm->hc_input_max_len;
 }
 
 int dethv_read_virt(dethv_vm_t *vm, uint64_t vaddr, void *dst, size_t len) {

@@ -27,6 +27,8 @@ static void print_usage(const char *prog) {
         "  --env <K=V>           Add deterministic guest environment variable (repeatable)\n"
         "  --stdin <file>        Feed file contents as guest stdin\n"
         "  --stdin-str <str>     Feed literal string as guest stdin\n"
+        "  --input <file>        Feed file contents to DETHV_HC_GET_INPUT hypercall\n"
+        "  --input-str <str>     Feed literal string to DETHV_HC_GET_INPUT hypercall\n"
         "  --trace               Trace all guest syscalls\n"
         "  --quiet               Do not print guest stdout/stderr\n"
         "  --stats               Print execution & determinism statistics\n"
@@ -34,6 +36,7 @@ static void print_usage(const char *prog) {
         "  --snap-sym <name>     Take snapshot upon hitting ELF symbol <name>\n"
         "  --snap-addr <hex>     Take snapshot upon hitting virtual address <hex>\n"
         "  --snap-on-stdin       Take snapshot right before first read(0, ...) from stdin\n"
+        "  --snap-on-hc          Take snapshot upon first dethv_get_input() / dethv_snapshot() hypercall\n"
         "  --save-snap <file>    Save taken snapshot to disk (.dhvs)\n"
         "  --load-snap <file>    Reload VM directly from saved disk snapshot (.dhvs)\n"
         "  --bench-snap <N>      Take snapshot and benchmark N ultra-fast reload+execute iterations\n"
@@ -193,6 +196,7 @@ static int run_snapshot_fuzzer(dethv_vm_t *vm, dethv_snapshot_t *snap,
             break;
         }
         dethv_set_stdin(vm, mut, mlen);
+        dethv_set_input(vm, mut, mlen);
 
         uint64_t prev_cov = dethv_cov_get_count(vm);
         dethv_run_result_t res;
@@ -242,6 +246,7 @@ static int run_snapshot_fuzzer(dethv_vm_t *vm, dethv_snapshot_t *snap,
                 /* Verify 100% deterministic crash reproducibility immediately! */
                 dethv_snapshot_restore(vm, snap);
                 dethv_set_stdin(vm, mut, mlen);
+                dethv_set_input(vm, mut, mlen);
                 dethv_run_result_t repro;
                 dethv_run(vm, &repro);
                 if (repro.reason != res.reason || repro.fault_rip != res.fault_rip ||
@@ -283,9 +288,12 @@ int main(int argc, char **argv) {
 
     const char *stdin_file = NULL;
     const char *stdin_str  = NULL;
+    const char *input_file = NULL;
+    const char *input_str  = NULL;
     const char *snap_sym   = NULL;
     uint64_t    snap_addr  = 0;
     bool        snap_on_stdin = false;
+    bool        snap_on_hc    = false;
     const char *save_snap_path = NULL;
     const char *load_snap_path = NULL;
     int         verify_runs = 0;
@@ -336,6 +344,10 @@ int main(int argc, char **argv) {
             stdin_file = argv[++argi];
         } else if (strcmp(a, "--stdin-str") == 0 && argi + 1 < argc) {
             stdin_str = argv[++argi];
+        } else if (strcmp(a, "--input") == 0 && argi + 1 < argc) {
+            input_file = argv[++argi];
+        } else if (strcmp(a, "--input-str") == 0 && argi + 1 < argc) {
+            input_str = argv[++argi];
         } else if (strcmp(a, "--trace") == 0) {
             cfg.trace_syscalls = true;
         } else if (strcmp(a, "--quiet") == 0) {
@@ -352,6 +364,8 @@ int main(int argc, char **argv) {
             snap_addr = strtoull(argv[++argi], NULL, 0);
         } else if (strcmp(a, "--snap-on-stdin") == 0) {
             snap_on_stdin = true;
+        } else if (strcmp(a, "--snap-on-hc") == 0) {
+            snap_on_hc = true;
         } else if (strcmp(a, "--save-snap") == 0 && argi + 1 < argc) {
             save_snap_path = argv[++argi];
         } else if (strcmp(a, "--load-snap") == 0 && argi + 1 < argc) {
@@ -392,10 +406,23 @@ int main(int argc, char **argv) {
         memcpy(stdin_data, stdin_str, stdin_len + 1);
     }
 
+    uint8_t *input_data = NULL;
+    size_t input_len = 0;
+    if (input_file) {
+        input_data = read_entire_file(input_file, &input_len);
+        if (!input_data) { free(stdin_data); return 1; }
+    } else if (input_str) {
+        input_len = strlen(input_str);
+        input_data = malloc(input_len + 1);
+        memcpy(input_data, input_str, input_len + 1);
+    }
+
     /* Mode 1: Determinism verification across N independent fresh KVM VMs */
     if (verify_runs > 0) {
         if (!guest_path) {
             fprintf(stderr, "--verify requires a guest ELF path\n");
+            free(stdin_data);
+            free(input_data);
             return 1;
         }
         cfg.capture_output = true;
@@ -413,6 +440,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (stdin_data) dethv_set_stdin(vm, stdin_data, stdin_len);
+            if (input_data) dethv_set_input(vm, input_data, input_len);
 
             dethv_run_result_t r;
             dethv_run(vm, &r);
@@ -447,6 +475,7 @@ int main(int argc, char **argv) {
                     dethv_destroy(vm);
                     free(ref_out);
                     free(stdin_data);
+                    free(input_data);
                     return 2;
                 }
             }
@@ -459,6 +488,7 @@ int main(int argc, char **argv) {
         print_stats(&ref, total_ms / (double)verify_runs);
         free(ref_out);
         free(stdin_data);
+        free(input_data);
         return 0;
     }
 
@@ -483,15 +513,17 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (stdin_data) dethv_set_stdin(vm, stdin_data, stdin_len);
+        if (input_data) dethv_set_input(vm, input_data, input_len);
     } else {
         if (dethv_load_elf(vm, guest_path, guest_argc, guest_argv, guest_env) < 0) {
             dethv_destroy(vm);
             return 1;
         }
         if (stdin_data) dethv_set_stdin(vm, stdin_data, stdin_len);
+        if (input_data) dethv_set_input(vm, input_data, input_len);
 
         /* Configure snapshot trigger if requested */
-        bool want_snap = (snap_sym != NULL || snap_addr != 0 || snap_on_stdin ||
+        bool want_snap = (snap_sym != NULL || snap_addr != 0 || snap_on_stdin || snap_on_hc ||
                           save_snap_path != NULL || bench_snap_iters > 0 || fuzz_iters > 0);
         if (snap_sym) {
             uint64_t addr = dethv_lookup_symbol(vm, snap_sym);
@@ -504,7 +536,13 @@ int main(int argc, char **argv) {
             dethv_set_snapshot_addr(vm, addr);
         } else if (snap_addr) {
             dethv_set_snapshot_addr(vm, snap_addr);
-        } else if (snap_on_stdin || bench_snap_iters > 0 || fuzz_iters > 0) {
+        } else if (snap_on_hc && !snap_on_stdin) {
+            dethv_set_snapshot_on_hc(vm, true);
+        } else if (snap_on_stdin && !snap_on_hc) {
+            dethv_set_snapshot_on_stdin(vm, true);
+        } else if (want_snap) {
+            /* Auto-arm BOTH hypercall (dethv_get_input/dethv_snapshot) and stdin triggers! */
+            dethv_set_snapshot_on_hc(vm, true);
             dethv_set_snapshot_on_stdin(vm, true);
         }
 
@@ -552,6 +590,7 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < bench_snap_iters; i++) {
             if (dethv_snapshot_restore(vm, snap) < 0) return 1;
             if (stdin_data) dethv_set_stdin(vm, stdin_data, stdin_len);
+            if (input_data) dethv_set_input(vm, input_data, input_len);
             dethv_run_result_t r;
             dethv_run(vm, &r);
             total_dirty += r.dirty_pages;
@@ -564,6 +603,7 @@ int main(int argc, char **argv) {
                 dethv_snapshot_free(snap);
                 dethv_destroy(vm);
                 free(stdin_data);
+                free(input_data);
                 return 2;
             }
         }
@@ -578,15 +618,19 @@ int main(int argc, char **argv) {
         dethv_snapshot_free(snap);
         dethv_destroy(vm);
         free(stdin_data);
+        free(input_data);
         return 0;
     }
 
     /* Mode 3: Snapshot Fuzzer */
     if (fuzz_iters > 0 && snap) {
-        int rc = run_snapshot_fuzzer(vm, snap, stdin_data, stdin_len, fuzz_iters, fuzz_seed, fuzz_max_len);
+        const uint8_t *fseed = input_data ? input_data : stdin_data;
+        size_t flen = input_data ? input_len : stdin_len;
+        int rc = run_snapshot_fuzzer(vm, snap, fseed, flen, fuzz_iters, fuzz_seed, fuzz_max_len);
         dethv_snapshot_free(snap);
         dethv_destroy(vm);
         free(stdin_data);
+        free(input_data);
         return rc;
     }
 
@@ -602,5 +646,6 @@ int main(int argc, char **argv) {
     if (snap) dethv_snapshot_free(snap);
     dethv_destroy(vm);
     free(stdin_data);
+    free(input_data);
     return exit_rc;
 }

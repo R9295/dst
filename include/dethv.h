@@ -79,10 +79,13 @@ uint64_t dethv_lookup_symbol(dethv_vm_t *vm, const char *sym_name);
 int  dethv_set_snapshot_addr(dethv_vm_t *vm, uint64_t vaddr);
 void dethv_set_snapshot_on_stdin(dethv_vm_t *vm, bool enable);
 void dethv_set_snapshot_on_open(dethv_vm_t *vm, const char *path_substr);
+void dethv_set_snapshot_on_hc(dethv_vm_t *vm, bool enable);
 
 /* Input / Virtual file injection (useful after snapshot reload for fuzzing!) */
-int dethv_set_stdin(dethv_vm_t *vm, const void *data, size_t len);
-int dethv_set_vfile(dethv_vm_t *vm, const char *path, const void *data, size_t len);
+int  dethv_set_stdin(dethv_vm_t *vm, const void *data, size_t len);
+int  dethv_set_input(dethv_vm_t *vm, const void *data, size_t len);
+void dethv_get_input_info(const dethv_vm_t *vm, uint64_t *guest_buf_vaddr, size_t *guest_max_len);
+int  dethv_set_vfile(dethv_vm_t *vm, const char *path, const void *data, size_t len);
 
 /* Read/write guest virtual memory */
 int dethv_read_virt(dethv_vm_t *vm, uint64_t vaddr, void *dst, size_t len);

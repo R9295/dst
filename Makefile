@@ -33,14 +33,14 @@ $(BUILD)/guest_stub_embed.c: $(BUILD)/guest_stub.bin
 $(BUILD)/guest_stub_embed.o: $(BUILD)/guest_stub_embed.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/%.o: src/%.c include/dethv.h include/internal.h include/guest_shared.h include/syscalls.h | $(BUILD)
+$(BUILD)/%.o: src/%.c include/dethv.h include/dethv_guest.h include/internal.h include/guest_shared.h include/syscalls.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/dethv: $(OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Test binaries (both dynamically-linked and statically-linked unmodified Linux ELF binaries!)
-tests: $(BUILD)/nondet_torture_dyn $(BUILD)/nondet_torture_static $(BUILD)/fuzz_target_dyn $(BUILD)/fuzz_target_static
+tests: $(BUILD)/nondet_torture_dyn $(BUILD)/nondet_torture_static $(BUILD)/fuzz_target_dyn $(BUILD)/fuzz_target_static $(BUILD)/fuzz_hc_target_dyn $(BUILD)/fuzz_hc_target_static
 
 $(BUILD)/nondet_torture_dyn: tests/nondet_torture.c | $(BUILD)
 	$(CC) -O2 -g -Wall -Wextra -pthread $< -o $@
@@ -53,6 +53,12 @@ $(BUILD)/fuzz_target_dyn: tests/fuzz_target.c | $(BUILD)
 
 $(BUILD)/fuzz_target_static: tests/fuzz_target.c | $(BUILD)
 	$(CC) -O2 -g -Wall -Wextra -static -pthread $< -o $@
+
+$(BUILD)/fuzz_hc_target_dyn: tests/fuzz_hc_target.c include/dethv_guest.h | $(BUILD)
+	$(CC) -O2 -g -Wall -Wextra -Iinclude -pthread $< -o $@
+
+$(BUILD)/fuzz_hc_target_static: tests/fuzz_hc_target.c include/dethv_guest.h | $(BUILD)
+	$(CC) -O2 -g -Wall -Wextra -Iinclude -static -pthread $< -o $@
 
 test: all
 	bash tests/run_tests.sh

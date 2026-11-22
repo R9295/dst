@@ -16,7 +16,8 @@
 - **Ultra-Fast Snapshot Fuzzing (~46,000–49,000 exec/s on 1 vCPU)**:
   - Uses **x86_64 hardware guest `PTE_D` dirty-bit tracking** + a compact host-VMM dirty-page tracker (`host_dirty_gfns`) + a ~30 ns Ring-0 `CR3` TLB reload instead of expensive KVM NPT write-protect `#NPF` faults.
   - Restores CPU registers via zero-ioctl `KVM_SYNC_X86_REGS`.
-  - Supports snapshot triggers by ELF symbol (`--snap-sym`), virtual address (`--snap-addr`), or automatically right before the first `read(0, ...)` (`--snap-on-stdin`).
+  - Supports snapshot triggers by ELF symbol (`--snap-sym`), virtual address (`--snap-addr`), first `read(0, ...)` (`--snap-on-stdin`), or **automatically on the guest's `dethv_get_input()` / `dethv_snapshot()` hypercall** (`--snap-on-hc`, auto-armed by default for `--fuzz` / `--bench-snap` / `--save-snap`).
+  - Guest-side hypercall header (`include/dethv_guest.h`) using dedicated x86_64 `syscall` numbers (`0x44455400..0x44455404`, returning `-ENOSYS` safely on native Linux): `dethv_is_present()`, `dethv_get_input(buf, max_len)` (auto-snapshots + injects input), `dethv_snapshot()`, `dethv_done(rc)` (instant iteration exit skipping libc teardown), and `dethv_panic(code, msg, len)` (report harness invariant violations).
   - Supports **persistent disk snapshots** (`--save-snap` / `--load-snap` `.dhvs` files) that reload bit-for-bit deterministically in fresh OS processes.
   - Built-in deterministic snapshot fuzzer (`--fuzz`) with one-shot ELF symbol breakpoint coverage and automatic crash reproducibility verification.
 
@@ -45,8 +46,13 @@ make test
 # Benchmark 50,000 snapshot reloads + executions
 ./build/dethv --snap-on-stdin --stdin-str "HELLO_WORLD" --bench-snap 50000 ./build/fuzz_target_dyn
 
-# Run built-in deterministic snapshot fuzzer (100k iterations)
-./build/dethv --snap-on-stdin --fuzz 100000 --fuzz-seed 0x1337 --fuzz-max-len 16 ./build/fuzz_target_dyn
+# Run built-in deterministic snapshot fuzzer (auto-snapshots on dethv_get_input() or read(0))
+./build/dethv --fuzz 100000 --fuzz-seed 0x1337 --fuzz-max-len 16 ./build/fuzz_hc_target_dyn
+
+# Auto-snapshot at dethv_get_input(), save to disk, and replay any input in a fresh process
+./build/dethv --save-snap hc.dhvs ./build/fuzz_hc_target_dyn
+./build/dethv --load-snap hc.dhvs --input-str "DF!B" --stats
+
 # Run an unmodified Solana Agave local_cluster test 100% deterministically (4 GiB RAM)
 ./build/dethv --ram 4096 --quantum 200000 --env RUST_LOG=info --verify 3 -- \
   ./agave/target/release/deps/local_cluster-* test_local_cluster_start_and_exit --exact --nocapture --test-threads=1
@@ -57,6 +63,7 @@ make test
 | File | Responsibility |
 | --- | --- |
 | `include/dethv.h` | Public C API for embedding DetHV in custom fuzzers |
+| `include/dethv_guest.h` | Header-only guest hypercall API (`dethv_get_input`, `dethv_snapshot`, `dethv_done`, `dethv_panic`) |
 | `include/guest_shared.h` | Shared Ring-0 <-> VMM trap frame, vTSC, PMU, TLB-flush state |
 | `src/guest_stub.S` | Ring-0 guest kernel (`SYSCALL`, fast Ring-0 `RDTSC`/`RDTSCP`, zero-skid PMI + `#DB` landing, `CR3` flush) |
 | `src/vmm.c` | KVM VM/vCPU setup, split 3–4 GiB MMIO hole RAM slots, deterministic CPUID, XSAVE, exception handling, run loop |

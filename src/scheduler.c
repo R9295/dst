@@ -23,7 +23,7 @@ void sched_init(dethv_vm_t *vm) {
 
 int sched_num_runnable(const sched_state_t *sc) {
     int n = 0;
-    for (int i = 0; i < DETHV_MAX_THREADS; i++) {
+    for (uint32_t i = 0; i < sc->used_slots; i++) {
         if (sc->threads[i].state == THREAD_RUNNABLE) n++;
     }
     return n;
@@ -31,7 +31,7 @@ int sched_num_runnable(const sched_state_t *sc) {
 
 int sched_num_alive(const sched_state_t *sc) {
     int n = 0;
-    for (int i = 0; i < DETHV_MAX_THREADS; i++) {
+    for (uint32_t i = 0; i < sc->used_slots; i++) {
         if (sc->threads[i].state != THREAD_FREE && sc->threads[i].state != THREAD_EXITED)
             n++;
     }
@@ -60,12 +60,22 @@ void sched_load_current(dethv_vm_t *vm) {
     ioctl(vm->vcpu_fd, KVM_SET_XSAVE, &cur->xsave);
 }
 
-/* Arm or disarm AMD ExRetCond zero-skid PMU preemption before KVM_RUN */
 void sched_prepare_pmu(dethv_vm_t *vm) {
     int runnable = sched_num_runnable(&vm->sched);
     if (!vm->pmu_available || runnable <= 1 || vm->cfg.preempt_quantum == 0) {
         vm->shared->pmu_armed = 0;
         vm->shared->pmu_in_landing = 0;
+        vm->shared->pmu_need_prog = 0;
+        return;
+    }
+
+    if (vm->shared->pmu_in_landing) {
+        vm->shared->pmu_armed = 1;
+        return;
+    }
+
+    /* Fast path: if already armed & running in HW for the current thread, ZERO reprogramming! */
+    if (vm->shared->pmu_armed && vm->shared->pmu_hw_on && !vm->shared->pmu_need_prog) {
         return;
     }
 
@@ -74,106 +84,89 @@ void sched_prepare_pmu(dethv_vm_t *vm) {
         cur->branch_budget = vm->cfg.preempt_quantum;
     }
 
-    if (vm->shared->pmu_in_landing) {
-        /* Resuming an interrupted landing phase (e.g. after demand #PF or patched #BP) */
-        vm->shared->pmu_armed = 1;
-        return;
-    }
-
     uint64_t pmi_dist = cur->branch_budget - DETHV_PMU_SLACK;
-    /* 48-bit negative count so overflow triggers LAPIC PMI after pmi_dist branches */
     uint64_t init_ctr = ((1ULL << 48) - pmi_dist) & ((1ULL << 48) - 1);
     vm->shared->pmu_init_ctr   = init_ctr;
     vm->shared->pmu_exit_ctr   = init_ctr;
     vm->shared->pmu_slack      = DETHV_PMU_SLACK;
     vm->shared->pmu_in_landing = 0;
     vm->shared->pmu_armed      = 1;
+    vm->shared->pmu_need_prog  = 1;
     vm->lapic_touched          = true;
 }
 
-/* Account retired conditional branches after SYSCALL or exception exit */
 void sched_account_pmu(dethv_vm_t *vm) {
-    if (!vm->shared->pmu_armed) return;
-    guest_thread_t *cur = &vm->sched.threads[vm->sched.current_idx];
-
-    uint64_t elapsed = 0;
-    if (vm->shared->pmu_exit_ctr == UINT64_MAX) {
-        /* Exited during landing phase! */
-        uint64_t pmi_dist = (cur->branch_budget > DETHV_PMU_SLACK)
-                            ? (cur->branch_budget - DETHV_PMU_SLACK) : 0;
-        uint64_t landed = (DETHV_PMU_SLACK > vm->shared->pmu_landing_rem)
-                          ? (DETHV_PMU_SLACK - vm->shared->pmu_landing_rem) : 0;
-        elapsed = pmi_dist + landed;
-    } else {
-        uint64_t mask = (1ULL << 48) - 1;
-        elapsed = (vm->shared->pmu_exit_ctr - vm->shared->pmu_init_ctr) & mask;
-        /* Guard against wrap if slightly over budget */
-        if (elapsed > cur->branch_budget + DETHV_PMU_SLACK) {
-            elapsed = cur->branch_budget;
-        }
-    }
-
-    vm->det.total_branches += elapsed;
-    if (elapsed >= cur->branch_budget) {
-        cur->branch_budget = 0;
-    } else {
-        cur->branch_budget -= elapsed;
-    }
+    /* Only account on thread switches (avoids rdmsr/wrmsr on every same-thread syscall!) */
+    (void)vm;
 }
 
-/* Check and wake any sleeping/timed-out threads whose virtual wake time arrived */
-static bool wake_expired_timers(dethv_vm_t *vm) {
+bool sched_wake_expired_timers(dethv_vm_t *vm) {
     bool woke = false;
     uint64_t now = vm->det.vmono_ns;
-    for (int i = 0; i < DETHV_MAX_THREADS; i++) {
+    bool timerfd_fired = (net_earliest_timer_ns(vm) <= now);
+
+    for (uint32_t i = 0; i < vm->sched.used_slots; i++) {
         guest_thread_t *t = &vm->sched.threads[i];
         if ((t->state == THREAD_BLOCKED_SLEEP || t->state == THREAD_BLOCKED_FUTEX) &&
             t->has_timeout && now >= t->wake_time_ns) {
-            t->pending_ret = (t->state == THREAD_BLOCKED_FUTEX) ? -ETIMEDOUT : 0;
+            t->pending_ret     = (t->state == THREAD_BLOCKED_FUTEX) ? -ETIMEDOUT : 0;
             t->has_pending_ret = true;
-            t->has_timeout = false;
-            t->state = THREAD_RUNNABLE;
-            t->branch_budget = vm->cfg.preempt_quantum;
+            t->has_timeout     = false;
+            t->state           = THREAD_RUNNABLE;
+            t->branch_budget   = vm->cfg.preempt_quantum;
             woke = true;
+        } else if (t->state == THREAD_BLOCKED_IO) {
+            if (t->has_timeout && now >= t->wake_time_ns) {
+                t->io_timed_out  = true;
+                t->has_timeout   = false;
+                t->state         = THREAD_RUNNABLE;
+                t->branch_budget = vm->cfg.preempt_quantum;
+                woke = true;
+            } else if (timerfd_fired) {
+                t->state         = THREAD_RUNNABLE;
+                t->branch_budget = vm->cfg.preempt_quantum;
+                woke = true;
+            }
         }
     }
     return woke;
 }
 
-/* Deterministic round-robin switch to the next runnable thread */
 bool sched_switch_next(dethv_vm_t *vm, bool current_yielded) {
     sched_state_t *sc = &vm->sched;
     int old_idx = sc->current_idx;
     guest_thread_t *old_t = &sc->threads[old_idx];
 
-    /* Save outgoing thread state */
     sched_save_current(vm);
     if (current_yielded && old_t->state == THREAD_RUNNABLE) {
         old_t->branch_budget = vm->cfg.preempt_quantum;
     }
-
-    /* Reset any in-flight landing state when switching threads */
+    /* Always cancel any in-progress #DB landing and force fresh PERF_CTR0
+     * programming across every cooperative switch/yield so host PMI skid timing
+     * can never leak a partially-consumed/overflowed counter into another thread! */
     vm->shared->pmu_in_landing = 0;
+    vm->shared->pmu_need_prog  = 1;
 
-    /* First wake any threads whose virtual timer expired */
-    wake_expired_timers(vm);
+    sched_wake_expired_timers(vm);
 
-    /* Round-robin search strictly after old_idx for deterministic fairness! */
+    uint32_t slots = sc->used_slots ? sc->used_slots : 1;
     int next_idx = -1;
-    for (int step = 1; step <= DETHV_MAX_THREADS; step++) {
-        int idx = (old_idx + step) % DETHV_MAX_THREADS;
+    for (uint32_t step = 1; step <= slots; step++) {
+        int idx = (int)(((uint32_t)old_idx + step) % slots);
         if (sc->threads[idx].state == THREAD_RUNNABLE) {
             next_idx = idx;
             break;
         }
     }
 
-    /* If nobody is runnable right now, fast-forward deterministic virtual clock to earliest timer! */
     if (next_idx < 0) {
-        uint64_t earliest = UINT64_MAX;
-        for (int i = 0; i < DETHV_MAX_THREADS; i++) {
+        /* Fast-forward virtual clock deterministically to earliest timer across threads & timerfds! */
+        uint64_t earliest = net_earliest_timer_ns(vm);
+        for (uint32_t i = 0; i < slots; i++) {
             guest_thread_t *t = &sc->threads[i];
-            if ((t->state == THREAD_BLOCKED_SLEEP || t->state == THREAD_BLOCKED_FUTEX) &&
+            if ((t->state == THREAD_BLOCKED_SLEEP ||
+                 t->state == THREAD_BLOCKED_FUTEX ||
+                 t->state == THREAD_BLOCKED_IO) &&
                 t->has_timeout && t->wake_time_ns < earliest) {
                 earliest = t->wake_time_ns;
             }
@@ -182,11 +175,11 @@ bool sched_switch_next(dethv_vm_t *vm, bool current_yielded) {
             if (earliest > vm->det.vmono_ns) {
                 uint64_t delta = earliest - vm->det.vmono_ns;
                 det_advance_time(&vm->det, delta);
-                vm->shared->vtsc += (delta * 25) / 10; /* ~2.5 GHz virtual TSC */
+                vm->shared->vtsc += (delta * 25) / 10;
             }
-            wake_expired_timers(vm);
-            for (int step = 1; step <= DETHV_MAX_THREADS; step++) {
-                int idx = (old_idx + step) % DETHV_MAX_THREADS;
+            sched_wake_expired_timers(vm);
+            for (uint32_t step = 1; step <= slots; step++) {
+                int idx = (int)(((uint32_t)old_idx + step) % slots);
                 if (sc->threads[idx].state == THREAD_RUNNABLE) {
                     next_idx = idx;
                     break;
@@ -196,7 +189,6 @@ bool sched_switch_next(dethv_vm_t *vm, bool current_yielded) {
     }
 
     if (next_idx < 0) {
-        /* All alive threads deadlocked with no timers! */
         vm->running = false;
         vm->stop_reason = (sched_num_alive(sc) == 0) ? DETHV_STOP_EXITED : DETHV_STOP_DEADLOCK;
         return false;
@@ -224,7 +216,6 @@ int sched_create_thread(dethv_vm_t *vm, uint64_t flags, uint64_t child_stack,
     }
     if (slot < 0) return -EAGAIN;
 
-    /* Snapshot parent's current FPU/SSE/AVX & regs */
     sched_save_current(vm);
     guest_thread_t *parent = &sc->threads[sc->current_idx];
     guest_thread_t *child  = &sc->threads[slot];
@@ -237,25 +228,17 @@ int sched_create_thread(dethv_vm_t *vm, uint64_t flags, uint64_t child_stack,
     child->state         = THREAD_RUNNABLE;
     child->tid           = tid;
     child->regs          = parent->regs;
-    child->regs.rax      = 0; /* clone() returns 0 in child! */
-    if (child_stack != 0) {
-        child->regs.rsp  = child_stack;
-    }
+    child->regs.rax      = 0;
+    if (child_stack != 0) child->regs.rsp = child_stack;
     child->xsave         = parent->xsave;
     child->fs_base       = (flags & CLONE_SETTLS) ? tls_val : parent->fs_base;
     child->gs_base       = parent->gs_base;
     child->sigmask       = parent->sigmask;
     child->branch_budget = vm->cfg.preempt_quantum;
 
-    if (flags & CLONE_PARENT_SETTID) {
-        mmu_copy_to_guest(vm, ptid_vaddr, &tid, sizeof(tid));
-    }
-    if (flags & CLONE_CHILD_SETTID) {
-        mmu_copy_to_guest(vm, ctid_vaddr, &tid, sizeof(tid));
-    }
-    if (flags & CLONE_CHILD_CLEARTID) {
-        child->clear_child_tid = ctid_vaddr;
-    }
+    if (flags & CLONE_PARENT_SETTID)  mmu_copy_to_guest(vm, ptid_vaddr, &tid, sizeof(tid));
+    if (flags & CLONE_CHILD_SETTID)   mmu_copy_to_guest(vm, ctid_vaddr, &tid, sizeof(tid));
+    if (flags & CLONE_CHILD_CLEARTID) child->clear_child_tid = ctid_vaddr;
 
     return tid;
 }
@@ -263,26 +246,18 @@ int sched_create_thread(dethv_vm_t *vm, uint64_t flags, uint64_t child_stack,
 int sched_futex_wait(dethv_vm_t *vm, uint64_t uaddr, uint32_t val, uint32_t bitset,
                      bool has_timeout, uint64_t timeout_ns, bool abs_time) {
     uint32_t cur_val = 0;
-    if (mmu_copy_from_guest(vm, &cur_val, uaddr, sizeof(cur_val)) < 0)
-        return -EFAULT;
-    if (cur_val != val)
-        return -EAGAIN;
+    if (mmu_copy_from_guest(vm, &cur_val, uaddr, sizeof(cur_val)) < 0) return -EFAULT;
+    if (cur_val != val) return -EAGAIN;
 
     guest_thread_t *cur = &vm->sched.threads[vm->sched.current_idx];
     cur->state        = THREAD_BLOCKED_FUTEX;
     cur->futex_addr   = uaddr;
     cur->futex_bitset = bitset ? bitset : 0xFFFFFFFFU;
     cur->has_timeout  = has_timeout;
-    if (has_timeout) {
-        cur->wake_time_ns = abs_time ? timeout_ns : (vm->det.vmono_ns + timeout_ns);
-    } else {
-        cur->wake_time_ns = 0;
-    }
+    cur->wake_time_ns = has_timeout ? (abs_time ? timeout_ns : (vm->det.vmono_ns + timeout_ns)) : 0;
 
-    /* Switch to another runnable thread (or fast-forward to timeout) */
     sched_switch_next(vm, true);
-    /* Return value was already written to new current thread's regs; caller must NOT overwrite RAX! */
-    return 1; /* Special signal: switched threads */
+    return 1;
 }
 
 int sched_futex_wake(dethv_vm_t *vm, uint64_t uaddr, int max_wake, uint32_t bitset) {
@@ -290,8 +265,7 @@ int sched_futex_wake(dethv_vm_t *vm, uint64_t uaddr, int max_wake, uint32_t bits
     if (bitset == 0) bitset = 0xFFFFFFFFU;
     int woken = 0;
 
-    /* Deterministic wake order: ascending slot index */
-    for (int i = 0; i < DETHV_MAX_THREADS && woken < max_wake; i++) {
+    for (uint32_t i = 0; i < vm->sched.used_slots && woken < max_wake; i++) {
         guest_thread_t *t = &vm->sched.threads[i];
         if (t->state == THREAD_BLOCKED_FUTEX &&
             t->futex_addr == uaddr &&
@@ -316,7 +290,7 @@ int sched_futex_requeue(dethv_vm_t *vm, uint64_t uaddr, int nr_wake, int nr_requ
     }
     int woken = sched_futex_wake(vm, uaddr, nr_wake, 0xFFFFFFFFU);
     int requeued = 0;
-    for (int i = 0; i < DETHV_MAX_THREADS && requeued < nr_requeue; i++) {
+    for (uint32_t i = 0; i < vm->sched.used_slots && requeued < nr_requeue; i++) {
         guest_thread_t *t = &vm->sched.threads[i];
         if (t->state == THREAD_BLOCKED_FUTEX && t->futex_addr == uaddr) {
             t->futex_addr = uaddr2;
@@ -334,10 +308,23 @@ void sched_sleep_current(dethv_vm_t *vm, uint64_t wake_time_ns) {
     sched_switch_next(vm, true);
 }
 
+/* Rewind RIP back 2 bytes to `syscall` and block until I/O event or timeout! */
+void sched_block_io_current(dethv_vm_t *vm, bool has_timeout, uint64_t deadline_ns) {
+    guest_thread_t *cur = &vm->sched.threads[vm->sched.current_idx];
+    vm->shared->regs.rip -= 2;
+    cur->state = THREAD_BLOCKED_IO;
+    if (!cur->io_waiting) {
+        cur->io_waiting   = true;
+        cur->io_timed_out = false;
+        cur->has_timeout  = has_timeout;
+        cur->wake_time_ns = has_timeout ? deadline_ns : 0;
+    }
+    sched_switch_next(vm, true);
+}
+
 bool sched_exit_current_thread(dethv_vm_t *vm, int exit_code) {
     guest_thread_t *cur = &vm->sched.threads[vm->sched.current_idx];
 
-    /* Handle CLONE_CHILD_CLEARTID / set_tid_address (used by pthread_join!) */
     if (cur->clear_child_tid != 0) {
         int32_t zero = 0;
         mmu_copy_to_guest(vm, cur->clear_child_tid, &zero, sizeof(zero));

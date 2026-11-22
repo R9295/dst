@@ -25,19 +25,28 @@
 #define PTE_NX              (1ULL << 63)
 #define PTE_ADDR_MASK       0x000FFFFFFFFFF000ULL
 
-/* Limits */
-#define DETHV_MAX_VMAS          512
-#define DETHV_MAX_THREADS       64
-#define DETHV_MAX_FDS           128
-#define DETHV_MAX_VFILES        64
-#define DETHV_MAX_PIPES         32
-#define DETHV_MAX_PATCHES       4096
+/* Scalable limits (designed for both 50k exec/s fuzz targets and massive Rust validators!) */
+#define DETHV_MAX_VMAS          8192
+#define DETHV_MAX_THREADS       512
+#define DETHV_MAX_FDS           2048
+#define DETHV_MAX_VFILES        4096
+#define DETHV_MAX_PIPES         128
+#define DETHV_MAX_SOCKETS       512
+#define DETHV_MAX_EPOLLS        64
+#define DETHV_MAX_EPOLL_WATCHES 512
+#define DETHV_MAX_TIMERS        64
+#define DETHV_MAX_IOURINGS      64
+#define DETHV_MAX_PATCHES       65536
+#define DETHV_PATCH_HT_SIZE     131072  /* Power of 2, > 2 * MAX_PATCHES */
 #define DETHV_MAX_SYMBOLS       4096
 #define DETHV_MAX_SIGNALS       64
-#define DETHV_OUT_CAP           (1024 * 1024) /* 1 MB captured stdout/stderr */
+#define DETHV_OUT_CAP           (16 * 1024 * 1024) /* 16 MB stdout/stderr capture */
 #define DETHV_PIPE_BUF_SIZE     65536
-#define DETHV_DIRTY_RING_BYTES  (256 * 1024)  /* 16384 dirty entries */
+#define DETHV_STREAM_BUF_SIZE   262144
+#define DETHV_UDP_QUEUE_LEN     256
+#define DETHV_DIRTY_RING_BYTES  (256 * 1024)
 #define DETHV_MAX_HOST_DIRTY    16384
+#define DETHV_MAX_FREE_PAGES    65536
 
 /* Fixed deterministic virtual addresses */
 #define GUEST_PIE_BASE          0x0000555555554000ULL
@@ -74,7 +83,9 @@ typedef struct {
     uint64_t start;
     uint64_t end;
     uint32_t prot;              /* PROT_READ | PROT_WRITE | PROT_EXEC */
-    uint32_t flags;             /* MAP_ANONYMOUS, MAP_STACK, etc. */
+    uint32_t flags;             /* MAP_ANONYMOUS, MAP_SHARED, MAP_STACK, etc. */
+    int32_t  vfile_idx;         /* >= 0 for MAP_SHARED backing on a virtual file */
+    uint64_t file_off;
 } vma_t;
 
 typedef struct {
@@ -97,6 +108,9 @@ int      mmu_unmap_page(dethv_vm_t *vm, uint64_t vaddr);
 int      mmu_protect_page(dethv_vm_t *vm, uint64_t vaddr, uint64_t pte_flags);
 uint64_t mmu_virt_to_phys(const dethv_vm_t *vm, uint64_t vaddr, uint64_t *pte_out);
 uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, bool populate);
+void     mmu_set_vma_vfile(dethv_vm_t *vm, uint64_t start, int32_t vfile_idx, uint64_t file_off);
+void     mmu_sync_vfile_from_vmas(dethv_vm_t *vm, int32_t vfile_idx);
+void     mmu_sync_all_shared_vmas_in_range(dethv_vm_t *vm, uint64_t start, uint64_t end);
 int      mmu_munmap_region(dethv_vm_t *vm, uint64_t addr, size_t len);
 int      mmu_mprotect_region(dethv_vm_t *vm, uint64_t addr, size_t len, uint32_t prot);
 uint64_t mmu_brk(dethv_vm_t *vm, uint64_t new_brk);
@@ -126,11 +140,17 @@ typedef struct {
 } patch_entry_t;
 
 typedef struct {
-    uint32_t      count;
-    uint64_t      cov_hits;
-    patch_entry_t entries[DETHV_MAX_PATCHES];
+    uint32_t       count;
+    uint64_t       cov_hits;
+    patch_entry_t *entries;     /* Dynamically allocated up to DETHV_MAX_PATCHES */
+    uint32_t       cap;
+    int32_t       *ht;          /* Open-addressing hash table [DETHV_PATCH_HT_SIZE] -> index or -1 */
 } patch_table_t;
 
+int            x86_patch_init(patch_table_t *pt);
+void           x86_patch_destroy(patch_table_t *pt);
+int            x86_patch_clone(patch_table_t *dst, const patch_table_t *src);
+void           x86_patch_rebuild_ht(patch_table_t *pt);
 int            x86_scan_and_patch_range(dethv_vm_t *vm, uint64_t vaddr, size_t len);
 patch_entry_t *x86_patch_find(patch_table_t *pt, uint64_t vaddr);
 int            x86_patch_add_bp(dethv_vm_t *vm, uint64_t vaddr, patch_kind_t kind);
@@ -161,32 +181,39 @@ typedef enum {
     FD_DEV_URANDOM,
     FD_PROC_VFILE,
     FD_MEM_VFILE,
+    FD_DIR,
     FD_HOST_RO,
     FD_PIPE_READ,
     FD_PIPE_WRITE,
-    FD_EVENTFD
+    FD_EVENTFD,
+    FD_SOCKET,
+    FD_EPOLL,
+    FD_TIMERFD,
+    FD_IO_URING
 } fd_kind_t;
 
 typedef struct {
     bool      used;
     fd_kind_t kind;
-    int       flags;            /* O_RDONLY, O_WRONLY, O_NONBLOCK, O_CLOEXEC, etc. */
-    int       host_fd;          /* Only for FD_HOST_RO (reopened on disk snapshot load!) */
+    int       flags;
+    int       host_fd;          /* Only for FD_HOST_RO */
     uint64_t  offset;
-    uint32_t  ref_idx;          /* Index into vfiles[] or pipes[] */
+    uint32_t  ref_idx;          /* Index into vfiles[], pipes[], sockets[], epolls[], timers[] */
     uint64_t  eventfd_val;      /* For FD_EVENTFD */
-    char      path[256];
+    uint64_t  io_gen;           /* Monotonic I/O event generation for EPOLLET edge triggering */
+    char      path[512];
     uint64_t  cached_size;
     uint32_t  cached_mode;
 } vfd_t;
 
 typedef struct {
     bool     used;
-    char     path[256];
+    bool     is_dir;
+    char     path[512];
     uint32_t mode;
     size_t   len;
     size_t   cap;
-    uint8_t *data;              /* Heap buffer (copied on snapshot!) */
+    uint8_t *data;
 } vfile_t;
 
 typedef struct {
@@ -196,13 +223,14 @@ typedef struct {
     uint32_t count;
     bool     write_closed;
     bool     read_closed;
+    uint64_t io_gen;
     uint8_t  buf[DETHV_PIPE_BUF_SIZE];
 } vpipe_t;
 
 typedef struct {
     vfd_t    fds[DETHV_MAX_FDS];
-    vpipe_t  pipes[DETHV_MAX_PIPES];
-    /* Captured stdout/stderr + virtual stdin */
+    vpipe_t *pipes;             /* Heap-allocated [DETHV_MAX_PIPES] */
+    uint32_t max_fd_used;
     uint8_t *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
@@ -211,12 +239,11 @@ typedef struct {
     size_t   stdout_len;
     uint8_t *stderr_buf;
     size_t   stderr_len;
-    /* Virtual overlay files (COW writes, /proc, fuzz input files) */
-    vfile_t  vfiles[DETHV_MAX_VFILES];
-    char     cwd[256];
-    char     exe_path[256];
+    vfile_t *vfiles;            /* Heap-allocated [DETHV_MAX_VFILES] */
+    uint32_t max_vfile_used;
+    char     cwd[512];
+    char     exe_path[512];
     uint32_t umask_val;
-    /* Dirty tracking flags for ultra-fast snapshot restore! */
     bool     fds_dirty;
     bool     pipes_dirty;
     bool     vfiles_dirty;
@@ -227,18 +254,160 @@ int     vfs_init(dethv_vm_t *vm);
 void    vfs_destroy(vfs_state_t *vfs);
 int     vfs_clone(vfs_state_t *dst, const vfs_state_t *src);
 int     vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src);
+void    vfs_resolve_path(const vfs_state_t *vfs, int dirfd, const char *path, char *out, size_t out_sz);
+int     vfs_alloc_fd(vfs_state_t *vfs, int min_fd);
 int     vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t mode);
 int64_t vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count);
 int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count);
 int64_t vfs_pread(dethv_vm_t *vm, int fd, void *buf, size_t count, int64_t off);
+int64_t vfs_pwrite(dethv_vm_t *vm, int fd, const void *buf, size_t count, int64_t off);
 int64_t vfs_lseek(dethv_vm_t *vm, int fd, int64_t off, int whence);
+int     vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length);
+int     vfs_truncate_path(dethv_vm_t *vm, const char *path, int64_t length);
 int     vfs_close(dethv_vm_t *vm, int fd);
 int     vfs_dup(dethv_vm_t *vm, int oldfd, int newfd, int flags, bool exact);
 int     vfs_fstat(dethv_vm_t *vm, int fd, void *statbuf_out);
 int     vfs_stat_path(dethv_vm_t *vm, int dirfd, const char *path, void *statbuf_out, int flags);
+int     vfs_mkdir(dethv_vm_t *vm, int dirfd, const char *path, uint32_t mode);
+int     vfs_rmdir(dethv_vm_t *vm, int dirfd, const char *path);
+int     vfs_unlink(dethv_vm_t *vm, int dirfd, const char *path, int flags);
+int     vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
+int     vfs_link(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
+int64_t vfs_getdents64(dethv_vm_t *vm, int fd, void *buf, size_t count);
 int     vfs_pipe(dethv_vm_t *vm, int fds_out[2], int flags);
 int     vfs_eventfd(dethv_vm_t *vm, uint64_t initval, int flags);
 int     vfs_set_vfile_data(vfs_state_t *vfs, const char *path, const void *data, size_t len);
+
+/* ================= Deterministic Virtual Loopback Network, Epoll & TimerFD ================= */
+
+typedef struct {
+    uint32_t src_ip;            /* IPv4 network byte order (or 127.0.0.1) */
+    uint16_t src_port;          /* Host byte order */
+    uint8_t  is_ipv6;
+    uint32_t len;
+    uint8_t *data;
+} udp_pkt_t;
+
+typedef struct {
+    bool     used;
+    int      domain;            /* AF_INET, AF_INET6, AF_UNIX */
+    int      type;              /* SOCK_DGRAM, SOCK_STREAM */
+    int      protocol;
+    int      refcount;
+    bool     bound;
+    bool     listening;
+    bool     connected;
+    bool     peer_closed;
+    bool     shut_rd;
+    bool     shut_wr;
+    bool     ipv6_only;
+    bool     recv_pktinfo;
+    bool     reuseaddr;
+    bool     reuseport;
+    uint32_t local_ip;          /* Host byte order (0x7f000001 = 127.0.0.1) */
+    uint16_t local_port;        /* Host byte order */
+    uint32_t peer_ip;
+    uint16_t peer_port;
+    int32_t  peer_sock;         /* Connected stream socket index, or -1 */
+    uint64_t rcvtimeo_ns;       /* SO_RCVTIMEO (0 = infinite) */
+    uint64_t sndtimeo_ns;
+    int32_t  rcvbuf_sz;
+    int32_t  sndbuf_sz;
+    /* UDP datagram FIFO queue */
+    udp_pkt_t udp_q[DETHV_UDP_QUEUE_LEN];
+    uint32_t  udp_head;
+    uint32_t  udp_count;
+    /* Stream byte ring buffer (incoming data written by peer!) */
+    uint8_t  *stream_buf;
+    uint32_t  stream_read;
+    uint32_t  stream_write;
+    uint32_t  stream_count;
+    /* TCP listen backlog (indices of newly created server-side connected sockets) */
+    int32_t   accept_q[64];
+    uint32_t  accept_head;
+    uint32_t  accept_count;
+    uint64_t  io_gen;
+} vsock_t;
+
+typedef struct {
+    bool     used;
+    int      fd;
+    uint32_t events;
+    uint64_t data;
+    uint32_t last_reported;
+    uint64_t last_gen;
+} epoll_watch_t;
+
+typedef struct {
+    bool          used;
+    epoll_watch_t watches[DETHV_MAX_EPOLL_WATCHES];
+    uint32_t      num_watches;
+} vepoll_t;
+
+typedef struct {
+    bool     used;
+    int      clockid;
+    uint64_t next_expire_ns;    /* Monotonic deadline, 0 = disarmed */
+    uint64_t interval_ns;
+} vtimer_t;
+
+typedef struct {
+    vsock_t  *sockets;          /* Heap-allocated [DETHV_MAX_SOCKETS] */
+    vepoll_t *epolls;           /* Heap-allocated [DETHV_MAX_EPOLLS] */
+    vtimer_t *timers;           /* Heap-allocated [DETHV_MAX_TIMERS] */
+    uint16_t  next_ephemeral_port;
+    bool      dirty;
+} net_state_t;
+
+int      net_init(dethv_vm_t *vm);
+void     net_destroy(net_state_t *net);
+void     net_close_socket(dethv_vm_t *vm, uint32_t sidx);
+void     net_close_epoll(dethv_vm_t *vm, uint32_t eidx);
+void     net_close_timer(dethv_vm_t *vm, uint32_t tidx);
+uint32_t net_fd_poll_events(dethv_vm_t *vm, int fd);
+uint64_t net_earliest_timer_ns(const dethv_vm_t *vm);
+void     net_wake_io_waiters(dethv_vm_t *vm);
+int      net_sys_socket(dethv_vm_t *vm, int domain, int type, int protocol);
+int      net_sys_socketpair(dethv_vm_t *vm, int domain, int type, int protocol, int sv_out[2]);
+int      net_sys_bind(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen);
+int      net_sys_listen(dethv_vm_t *vm, int fd, int backlog);
+int      net_sys_connect(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen);
+int      net_sys_accept(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_inout, int flags);
+int      net_sys_getsockname(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_inout, bool peer);
+int      net_sys_setsockopt(dethv_vm_t *vm, int fd, int level, int optname, const void *optval, uint32_t optlen);
+int      net_sys_getsockopt(dethv_vm_t *vm, int fd, int level, int optname, void *optval, uint32_t *optlen_inout);
+int      net_sys_shutdown(dethv_vm_t *vm, int fd, int how);
+int64_t  net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags, const void *dest_addr, uint32_t addrlen);
+int64_t  net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags, void *src_addr_out, uint32_t *addrlen_inout, bool *would_block, uint64_t *timeout_ns_out);
+int      net_sys_epoll_create(dethv_vm_t *vm, int flags);
+int      net_sys_epoll_ctl(dethv_vm_t *vm, int epfd, int op, int fd, uint32_t events, uint64_t data);
+int      net_sys_epoll_wait(dethv_vm_t *vm, int epfd, uint64_t events_guest_ptr, int maxevents);
+int      net_sys_timerfd_create(dethv_vm_t *vm, int clockid, int flags);
+int      net_sys_timerfd_settime(dethv_vm_t *vm, int fd, int flags, uint64_t new_val_ns, uint64_t interval_ns, bool abs_time);
+int64_t  net_timerfd_read(dethv_vm_t *vm, int fd, uint64_t *exp_out);
+int      net_ioctl(dethv_vm_t *vm, int fd, uint64_t req, uint64_t arg);
+
+/* ================= Deterministic Virtual io_uring ================= */
+
+typedef struct {
+    bool      used;
+    uint32_t  sq_entries;
+    uint32_t  cq_entries;
+    uint32_t  setup_flags;
+    uint32_t  ring_npages;
+    uint32_t  sqe_npages;
+    uint32_t  cqes_off;
+    uint64_t *ring_phys;
+    uint64_t *sqe_phys;
+} viouring_t;
+
+int      iouring_init(dethv_vm_t *vm);
+void     iouring_destroy(dethv_vm_t *vm);
+void     iouring_close(dethv_vm_t *vm, uint32_t idx);
+int      iouring_sys_setup(dethv_vm_t *vm, uint32_t entries, uint64_t params_guest);
+uint64_t iouring_mmap(dethv_vm_t *vm, int fd, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, int64_t off);
+int      iouring_sys_enter(dethv_vm_t *vm, int fd, uint32_t to_submit, uint32_t min_complete, uint32_t flags);
+int      iouring_sys_register(dethv_vm_t *vm, int fd, uint32_t opcode, uint64_t arg, uint32_t nr_args);
 
 /* ================= Deterministic Multithreaded Scheduler ================= */
 
@@ -247,6 +416,7 @@ typedef enum {
     THREAD_RUNNABLE,
     THREAD_BLOCKED_FUTEX,
     THREAD_BLOCKED_SLEEP,
+    THREAD_BLOCKED_IO,
     THREAD_EXITED
 } thread_state_t;
 
@@ -260,6 +430,8 @@ typedef struct {
 typedef struct {
     thread_state_t   state;
     int32_t          tid;
+    char             name[20];
+    uint64_t         last_sys;
     user_regs_t      regs;
     uint64_t         fs_base;
     uint64_t         gs_base;
@@ -274,6 +446,8 @@ typedef struct {
     uint32_t         futex_bitset;
     uint64_t         wake_time_ns;      /* 0 = no timeout */
     bool             has_timeout;
+    bool             io_waiting;        /* Preserves original deadline across IO retries */
+    bool             io_timed_out;
     int64_t          pending_ret;       /* Return value when woken */
     bool             has_pending_ret;
 } guest_thread_t;
@@ -303,9 +477,11 @@ int      sched_futex_wake(dethv_vm_t *vm, uint64_t uaddr, int max_wake, uint32_t
 int      sched_futex_requeue(dethv_vm_t *vm, uint64_t uaddr, int nr_wake, int nr_requeue,
                              uint64_t uaddr2, bool check_val3, uint32_t val3);
 void     sched_sleep_current(dethv_vm_t *vm, uint64_t wake_time_ns);
+void     sched_block_io_current(dethv_vm_t *vm, bool has_timeout, uint64_t deadline_ns);
 bool     sched_exit_current_thread(dethv_vm_t *vm, int exit_code);
 void     sched_prepare_pmu(dethv_vm_t *vm);
 void     sched_account_pmu(dethv_vm_t *vm);
+bool     sched_wake_expired_timers(dethv_vm_t *vm);
 
 /* ================= Main Hypervisor VM Struct ================= */
 
@@ -324,14 +500,19 @@ struct dethv_vm {
     bool                   use_dirty_ring;
     bool                   dirty_ring_overflow;
 
-    /* Host-VMM dirty physical page tracker (catches VMM memcpy writes that bypass NPT!) */
+    /* Host-VMM dirty physical page tracker */
     uint32_t               host_dirty_gfns[DETHV_MAX_HOST_DIRTY];
     uint32_t               host_dirty_count;
     bool                   host_dirty_overflow;
     uint8_t               *host_dirty_bitmap;
     size_t                 host_dirty_bitmap_bytes;
     uint64_t               loaded_snap_id;
+    uint64_t               snap_phys_floor;   /* Do not recycle phys pages below this */
     dethv_snapshot_t      *active_cov_snap;
+
+    /* Physical page free list (reclaims munmap'd pages for long-running binaries!) */
+    uint64_t              *phys_free_list;
+    uint32_t               phys_free_count;
 
     /* Guest physical RAM */
     uint8_t               *mem;
@@ -351,11 +532,13 @@ struct dethv_vm {
     struct kvm_xcrs        initial_xcrs;
     struct kvm_lapic_state initial_lapic;
 
-    /* Core deterministic subsystems (all saved/restored in snapshots!) */
+    /* Core deterministic subsystems */
     det_state_t            det;
     mmu_state_t            mmu;
     sched_state_t          sched;
     vfs_state_t            vfs;
+    net_state_t            net;
+    viouring_t            *iourings;
     patch_table_t          patches;
     sym_table_t            syms;
 
@@ -377,10 +560,10 @@ struct dethv_vm {
     uint64_t               last_dirty_pages;
 };
 
-/* Writable leaf PTE entry cached at snapshot time for zero-VMEXIT hardware PTE_D dirty tracking! */
+/* Writable leaf PTE entry cached at snapshot time for zero-VMEXIT hardware PTE_D dirty tracking */
 typedef struct {
-    uint32_t pte_offset;   /* Byte offset of uint64_t PTE in guest RAM */
-    uint32_t phys_offset;  /* Byte offset of backed 4KB physical page in guest RAM */
+    uint64_t pte_offset;   /* Byte offset of uint64_t PTE in guest RAM */
+    uint64_t phys_offset;  /* Byte offset of backed 4KB physical page in guest RAM */
 } snap_wpte_t;
 
 /* Snapshot structure */
@@ -390,11 +573,10 @@ struct dethv_snapshot {
     uint64_t               id;
     size_t                 ram_size;
     size_t                 phys_used;
-    uint8_t               *mem;         /* Copy of [0 .. phys_used) */
-    snap_wpte_t           *wptes;       /* Compact list of writable PTEs for O(dirty) PTE_D reset */
+    uint8_t               *mem;
+    snap_wpte_t           *wptes;
     uint32_t               num_wptes;
 
-    /* Full vCPU architectural state */
     struct kvm_regs        regs;
     struct kvm_sregs       sregs;
     struct kvm_vcpu_events events;
@@ -402,7 +584,6 @@ struct dethv_snapshot {
     struct kvm_xcrs        xcrs;
     struct kvm_lapic_state lapic;
 
-    /* Full deterministic VMM subsystem state */
     det_state_t            det;
     mmu_state_t            mmu;
     sched_state_t          sched;
@@ -432,17 +613,17 @@ static inline void vmm_mark_phys_dirty(dethv_vm_t *vm, uint64_t phys_addr) {
     }
 }
 
-/* Embedded Ring-0 guest kernel binary (built from src/guest_stub.S) */
+/* Embedded Ring-0 guest kernel binary */
 extern const uint8_t guest_stub_bin[];
 extern const uint32_t guest_stub_bin_len;
 
-/* Fixed entry points exported by guest_stub.S (offsets from GUEST_STUB_VADDR) */
+/* Fixed entry points exported by guest_stub.S */
 #define STUB_OFF_ENTER_USER     0x0000
 #define STUB_OFF_SYSCALL_ENTRY  0x0200
 #define STUB_OFF_ISR_PMI        0x0400
 #define STUB_OFF_ISR_DB         0x0600
 #define STUB_OFF_ISR_GP         0x0900
 #define STUB_OFF_ISR_COMMON     0x0B00
-#define STUB_OFF_ISR_TABLE      0x0E00  /* 32 exception stubs, 16 bytes each */
+#define STUB_OFF_ISR_TABLE      0x0E00
 
 #endif /* DETHV_INTERNAL_H */

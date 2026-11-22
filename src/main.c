@@ -23,6 +23,8 @@ static void print_usage(const char *prog) {
         "  --ram <MB>            Guest RAM in MiB (default: 256)\n"
         "  --quantum <N>         Retired cond-branches per thread slice (default: 20000)\n"
         "  --max-syscalls <N>    Deterministic syscall timeout budget (0 = unlimited)\n"
+        "  --max-preempts <N>    Deterministic preempt timeout budget (0 = unlimited)\n"
+        "  --env <K=V>           Add deterministic guest environment variable (repeatable)\n"
         "  --stdin <file>        Feed file contents as guest stdin\n"
         "  --stdin-str <str>     Feed literal string as guest stdin\n"
         "  --trace               Trace all guest syscalls\n"
@@ -293,6 +295,16 @@ int main(int argc, char **argv) {
     size_t      fuzz_max_len = 64;
     bool        quiet = false;
     bool        show_stats = false;
+    char       *guest_env[64];
+    int         guest_envc = 0;
+    guest_env[guest_envc++] = "PATH=/usr/local/bin:/usr/bin:/bin";
+    guest_env[guest_envc++] = "HOME=/root";
+    guest_env[guest_envc++] = "USER=root";
+    guest_env[guest_envc++] = "TMPDIR=/tmp";
+    guest_env[guest_envc++] = "LANG=C";
+    guest_env[guest_envc++] = "LC_ALL=C";
+    guest_env[guest_envc++] = "TZ=UTC";
+    guest_env[guest_envc]   = NULL;
 
     int argi = 1;
     while (argi < argc) {
@@ -311,6 +323,15 @@ int main(int argc, char **argv) {
             cfg.preempt_quantum = strtoull(argv[++argi], NULL, 0);
         } else if (strcmp(a, "--max-syscalls") == 0 && argi + 1 < argc) {
             cfg.max_syscalls = strtoull(argv[++argi], NULL, 0);
+        } else if (strcmp(a, "--max-preempts") == 0 && argi + 1 < argc) {
+            cfg.max_preempts = strtoull(argv[++argi], NULL, 0);
+        } else if (strcmp(a, "--env") == 0 && argi + 1 < argc) {
+            if (guest_envc < 62) {
+                guest_env[guest_envc++] = argv[++argi];
+                guest_env[guest_envc] = NULL;
+            } else {
+                argi++;
+            }
         } else if (strcmp(a, "--stdin") == 0 && argi + 1 < argc) {
             stdin_file = argv[++argi];
         } else if (strcmp(a, "--stdin-str") == 0 && argi + 1 < argc) {
@@ -387,7 +408,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < verify_runs; i++) {
             dethv_vm_t *vm = dethv_create(&cfg);
             if (!vm) return 1;
-            if (dethv_load_elf(vm, guest_path, guest_argc, guest_argv, NULL) < 0) {
+            if (dethv_load_elf(vm, guest_path, guest_argc, guest_argv, guest_env) < 0) {
                 dethv_destroy(vm);
                 return 1;
             }
@@ -463,7 +484,7 @@ int main(int argc, char **argv) {
         }
         if (stdin_data) dethv_set_stdin(vm, stdin_data, stdin_len);
     } else {
-        if (dethv_load_elf(vm, guest_path, guest_argc, guest_argv, NULL) < 0) {
+        if (dethv_load_elf(vm, guest_path, guest_argc, guest_argv, guest_env) < 0) {
             dethv_destroy(vm);
             return 1;
         }

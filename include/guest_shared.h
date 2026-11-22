@@ -95,6 +95,8 @@
 #define GS_OFF_PMU_CTL_PMI      0x118
 #define GS_OFF_PMU_CTL_NO_PMI   0x120
 #define GS_OFF_FLUSH_TLB        0x128
+#define GS_OFF_PMU_NEED_PROG    0x130
+#define GS_OFF_PMU_HW_ON        0x138
 
 #ifndef __ASSEMBLER__
 
@@ -144,6 +146,8 @@ typedef struct {
     uint64_t pmu_ctl_pmi;        /* 0x118 */
     uint64_t pmu_ctl_no_pmi;     /* 0x120 */
     uint64_t flush_tlb;          /* 0x128 */
+    uint64_t pmu_need_prog;      /* 0x130: 1 = reprogram PERF_CTR0/CTL0 on next enter */
+    uint64_t pmu_hw_on;          /* 0x138: 1 = PERF_CTL0 is currently enabled in HW */
 } guest_shared_t;
 
 #include <stddef.h>
@@ -157,6 +161,8 @@ _Static_assert(offsetof(guest_shared_t, vtsc)            == GS_OFF_VTSC, "VTSC o
 _Static_assert(offsetof(guest_shared_t, pmu_armed)       == GS_OFF_PMU_ARMED, "PMU_ARMED offset");
 _Static_assert(offsetof(guest_shared_t, pmu_ctl_no_pmi)  == GS_OFF_PMU_CTL_NO_PMI, "PMU_CTL_NO_PMI offset");
 _Static_assert(offsetof(guest_shared_t, flush_tlb)       == GS_OFF_FLUSH_TLB, "FLUSH_TLB offset");
+_Static_assert(offsetof(guest_shared_t, pmu_need_prog)   == GS_OFF_PMU_NEED_PROG, "PMU_NEED_PROG offset");
+_Static_assert(offsetof(guest_shared_t, pmu_hw_on)       == GS_OFF_PMU_HW_ON, "PMU_HW_ON offset");
 
 #endif /* !__ASSEMBLER__ */
 #endif /* DETHV_GUEST_SHARED_H */

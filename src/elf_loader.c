@@ -174,7 +174,8 @@ static int map_elf_image(dethv_vm_t *vm, const uint8_t *buf, size_t sz,
         /* Record VMA & finalize page protections */
         if (vm->mmu.num_vmas < DETHV_MAX_VMAS) {
             vm->mmu.vmas[vm->mmu.num_vmas++] = (vma_t){
-                .start = map_start, .end = map_end, .prot = prot, .flags = MAP_PRIVATE
+                .start = map_start, .end = map_end, .prot = prot, .flags = MAP_PRIVATE,
+                .vfile_idx = -1, .file_off = 0
             };
         }
     }
@@ -321,7 +322,9 @@ int dethv_load_elf(dethv_vm_t *vm, const char *path, int argc, char **argv, char
             .start = vm->mmu.stack_limit,
             .end   = GUEST_STACK_TOP,
             .prot  = PROT_READ | PROT_WRITE,
-            .flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK
+            .flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+            .vfile_idx = -1,
+            .file_off  = 0
         };
     }
 

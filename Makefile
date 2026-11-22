@@ -4,8 +4,8 @@ LDFLAGS := -pthread
 
 BUILD   := build
 SRCS    := src/vmm.c src/mmu.c src/x86_patch.c src/elf_loader.c \
-           src/determinism.c src/scheduler.c src/vfs.c src/syscall.c \
-           src/snapshot.c src/main.c
+           src/determinism.c src/scheduler.c src/vfs.c src/net.c src/iouring.c \
+           src/syscall.c src/snapshot.c src/main.c
 OBJS    := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS)) $(BUILD)/guest_stub_embed.o
 
 .PHONY: all clean test tests

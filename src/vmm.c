@@ -9,6 +9,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+static volatile sig_atomic_t g_stop_requested = 0;
+static void handle_stop_sig(int sig) { (void)sig; g_stop_requested = 1; }
+
 /* MSR indices */
 #define MSR_EFER            0xC0000080U
 #define MSR_STAR            0xC0000081U
@@ -360,7 +363,15 @@ dethv_vm_t *dethv_create(const dethv_config_t *cfg_in) {
     /* We use zero-VMEXIT hardware guest PTE_D dirty tracking (no NPT write-protect faults!) */
     vm->use_dirty_ring = false;
 
-    /* Allocate guest physical RAM */
+    /* Split guest physical RAM around the x86 3GB..4GB MMIO/LAPIC/TSS hole!
+     * Keep vm->mem indexed 1:1 by guest_phys_addr (the 1GB hole is untouched virtual space = 0 RSS). */
+    const uint64_t MMIO_HOLE_START = 0xC0000000ULL; /* 3 GiB */
+    const uint64_t MMIO_HOLE_END   = 0x100000000ULL; /* 4 GiB */
+    size_t low_ram  = vm->ram_size <= MMIO_HOLE_START ? vm->ram_size : MMIO_HOLE_START;
+    size_t high_ram = vm->ram_size >  MMIO_HOLE_START ? (vm->ram_size - MMIO_HOLE_START) : 0;
+    size_t map_span = high_ram > 0 ? (MMIO_HOLE_END + high_ram) : low_ram;
+    vm->ram_size = map_span;
+
     vm->mem = mmap(NULL, vm->ram_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (vm->mem == MAP_FAILED) {
@@ -369,16 +380,29 @@ dethv_vm_t *dethv_create(const dethv_config_t *cfg_in) {
         goto fail;
     }
 
-    struct kvm_userspace_memory_region region = {
+    struct kvm_userspace_memory_region region0 = {
         .slot            = 0,
         .flags           = 0,
         .guest_phys_addr = 0,
-        .memory_size     = vm->ram_size,
+        .memory_size     = low_ram,
         .userspace_addr  = (uint64_t)vm->mem
     };
-    if (ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-        perror("KVM_SET_USER_MEMORY_REGION");
+    if (ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &region0) < 0) {
+        perror("KVM_SET_USER_MEMORY_REGION slot 0");
         goto fail;
+    }
+    if (high_ram > 0) {
+        struct kvm_userspace_memory_region region1 = {
+            .slot            = 1,
+            .flags           = 0,
+            .guest_phys_addr = MMIO_HOLE_END,
+            .memory_size     = high_ram,
+            .userspace_addr  = (uint64_t)(vm->mem + MMIO_HOLE_END)
+        };
+        if (ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &region1) < 0) {
+            perror("KVM_SET_USER_MEMORY_REGION slot 1");
+            goto fail;
+        }
     }
 
     vm->vcpu_fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, 0);
@@ -411,20 +435,24 @@ dethv_vm_t *dethv_create(const dethv_config_t *cfg_in) {
         }
     }
 
-    /* Allocate host-dirty tracking bitmap (1 bit per 4KB guest page) */
+    /* Allocate host-dirty tracking bitmap & physical page free list */
     vm->host_dirty_bitmap_bytes = ((vm->ram_size / PAGE_SIZE) + 7) / 8;
     vm->host_dirty_bitmap = calloc(1, vm->host_dirty_bitmap_bytes);
-    if (!vm->host_dirty_bitmap) goto fail;
+    vm->phys_free_list = malloc(DETHV_MAX_FREE_PAGES * sizeof(uint64_t));
+    if (!vm->host_dirty_bitmap || !vm->phys_free_list) goto fail;
 
     /* Check if AMD vPMU is available */
     vm->pmu_available = vm->cfg.enable_pmu;
 
     /* Initialize core deterministic subsystems */
     det_init(&vm->det, vm->cfg.seed, vm->cfg.start_time_ns);
+    if (x86_patch_init(&vm->patches) < 0) goto fail;
     if (mmu_init(vm) < 0) goto fail;
     if (setup_guest_kernel_structures(vm) < 0) goto fail;
     if (setup_vcpu_initial_state(vm) < 0) goto fail;
     if (vfs_init(vm) < 0) goto fail;
+    if (net_init(vm) < 0) goto fail;
+    if (iouring_init(vm) < 0) goto fail;
     sched_init(vm);
 
     return vm;
@@ -436,8 +464,12 @@ fail:
 
 void dethv_destroy(dethv_vm_t *vm) {
     if (!vm) return;
+    iouring_destroy(vm);
+    net_destroy(&vm->net);
     vfs_destroy(&vm->vfs);
+    x86_patch_destroy(&vm->patches);
     free(vm->host_dirty_bitmap);
+    free(vm->phys_free_list);
     if (vm->dirty_ring) munmap(vm->dirty_ring, DETHV_DIRTY_RING_BYTES);
     if (vm->kvm_run)    munmap(vm->kvm_run, vm->kvm_run_size);
     if (vm->mem)        munmap(vm->mem, vm->ram_size);
@@ -616,8 +648,66 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
     vm->fault_rip    = 0;
     vm->fault_addr   = 0;
     vm->fault_errcode = 0;
+    g_stop_requested = 0;
+    signal(SIGTERM, handle_stop_sig);
+    signal(SIGINT,  handle_stop_sig);
 
     while (vm->running) {
+        if (g_stop_requested) {
+            int n_run = 0, n_futex = 0, n_sleep = 0, n_io = 0;
+            for (uint32_t i = 0; i < vm->sched.used_slots; i++) {
+                switch (vm->sched.threads[i].state) {
+                    case THREAD_RUNNABLE:      n_run++;   break;
+                    case THREAD_BLOCKED_FUTEX: n_futex++; break;
+                    case THREAD_BLOCKED_SLEEP: n_sleep++; break;
+                    case THREAD_BLOCKED_IO:    n_io++;    break;
+                    default: break;
+                }
+            }
+            struct { struct kvm_msrs hdr; struct kvm_msr_entry e[2]; } pmu_m;
+            memset(&pmu_m, 0, sizeof(pmu_m));
+            pmu_m.hdr.nmsrs = 2;
+            pmu_m.e[0].index = 0xC0010000;
+            pmu_m.e[1].index = 0xC0010004;
+            ioctl(vm->vcpu_fd, KVM_GET_MSRS, &pmu_m);
+            struct kvm_lapic_state lap;
+            ioctl(vm->vcpu_fd, KVM_GET_LAPIC, &lap);
+            uint32_t lvt_pmi = *(uint32_t *)(lap.regs + 0x340);
+            uint32_t svr     = *(uint32_t *)(lap.regs + 0x0F0);
+            fprintf(stderr,
+                "\n[dethv] INTERRUPTED: tid=%d(%s) rip=0x%llx last_sys=%llu vmono=%.6fs syscalls=%llu preempts=%llu rdtsc=%llu\n"
+                "        threads: slots=%u runnable=%d futex=%d sleep=%d io=%d | pmu_armed=%llu landing=%llu steps=%llu\n"
+                "        PMU: ctl=0x%llx ctr=0x%llx init=0x%llx budget=%llu | LAPIC: svr=0x%x lvt_pmi=0x%x lapic_init=%llu\n",
+                vm->sched.threads[vm->sched.current_idx].tid,
+                vm->sched.threads[vm->sched.current_idx].name[0] ? vm->sched.threads[vm->sched.current_idx].name : "main",
+                (unsigned long long)vm->shared->regs.rip,
+                (unsigned long long)vm->sched.threads[vm->sched.current_idx].last_sys,
+                (double)vm->det.vmono_ns / 1e9,
+                (unsigned long long)vm->det.syscall_count,
+                (unsigned long long)vm->det.preempt_count,
+                (unsigned long long)vm->shared->rdtsc_traps,
+                vm->sched.used_slots, n_run, n_futex, n_sleep, n_io,
+                (unsigned long long)vm->shared->pmu_armed,
+                (unsigned long long)vm->shared->pmu_in_landing,
+                (unsigned long long)vm->shared->pmu_landing_steps,
+                (unsigned long long)pmu_m.e[0].data,
+                (unsigned long long)pmu_m.e[1].data,
+                (unsigned long long)vm->shared->pmu_init_ctr,
+                (unsigned long long)vm->sched.threads[vm->sched.current_idx].branch_budget,
+                svr, lvt_pmi,
+                (unsigned long long)vm->shared->lapic_init_done);
+            for (uint32_t i = 0; i < vm->sched.used_slots; i++) {
+                guest_thread_t *t = &vm->sched.threads[i];
+                if (t->state == THREAD_RUNNABLE || t->state == THREAD_BLOCKED_SLEEP || t->state == THREAD_BLOCKED_IO) {
+                    fprintf(stderr, "          tid=%d(%s) state=%d last_sys=%llu wake=%.3fs\n",
+                            t->tid, t->name[0] ? t->name : "main", (int)t->state,
+                            (unsigned long long)t->last_sys, (double)t->wake_time_ns / 1e9);
+                }
+            }
+            vm->stop_reason = DETHV_STOP_TIMEOUT;
+            vm->running = false;
+            break;
+        }
         /* Prepare deterministic PMU preemption if >1 thread runnable */
         sched_prepare_pmu(vm);
 
@@ -637,20 +727,24 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
                 vm->fs_base_dirty = false;
             }
             if (vm->sregs_dirty) {
-                /* Force KVM TLB flush by rewriting CR3 in synced sregs (or KVM_SET_SREGS if first run) */
-                struct kvm_sregs sregs;
-                if (ioctl(vm->vcpu_fd, KVM_GET_SREGS, &sregs) == 0) {
-                    sregs.cr3 = vm->mmu.pml4_phys;
-                    sregs.fs.base = vm->current_fs_base;
-                    ioctl(vm->vcpu_fd, KVM_SET_SREGS, &sregs);
-                }
+                /* Zero-ioctl Ring-0 CR3 reload flushes guest TLB in ~30ns! */
+                vm->shared->flush_tlb = 1;
                 vm->sregs_dirty = false;
             }
         }
 
         int rc = ioctl(vm->vcpu_fd, KVM_RUN, 0);
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (g_stop_requested) {
+                    struct kvm_regs kregs;
+                    if (ioctl(vm->vcpu_fd, KVM_GET_REGS, &kregs) == 0) {
+                        fprintf(stderr, "\n[dethv] INTERRUPTED IN KVM_RUN: guest_rip=0x%llx rsp=0x%llx rflags=0x%llx\n",
+                                (unsigned long long)kregs.rip, (unsigned long long)kregs.rsp, (unsigned long long)kregs.rflags);
+                    }
+                }
+                continue;
+            }
             perror("KVM_RUN");
             vm->stop_reason = DETHV_STOP_ERROR;
             vm->running = false;
@@ -676,8 +770,12 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
                 } else if (reason == DETHV_EXIT_PREEMPT) {
                     vm->det.preempt_count++;
                     vm->det.total_branches += vm->cfg.preempt_quantum;
-                    det_advance_time(&vm->det, 10000); /* 10 us deterministic slice */
-                    vm->shared->vtsc += 25000;
+                    vm->shared->pmu_need_prog = 1;
+                    /* Advance virtual clock proportionally to simulated CPU work (5ns/branch) */
+                    uint64_t slice_ns = vm->cfg.preempt_quantum * 5ULL;
+                    if (slice_ns < 10000) slice_ns = 10000;
+                    det_advance_time(&vm->det, slice_ns);
+                    vm->shared->vtsc += (slice_ns * 25) / 10;
                     if (vm->cfg.max_preempts && vm->det.preempt_count >= vm->cfg.max_preempts) {
                         vm->stop_reason = DETHV_STOP_TIMEOUT;
                         vm->running = false;

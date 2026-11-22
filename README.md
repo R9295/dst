@@ -9,8 +9,11 @@
   - **Time & TSC**: `CR4.TSD = 1` traps `RDTSC` and `RDTSCP` in Ring 3 and emulates them directly inside Ring 0 (~60 ns, zero VMEXITs) against a deterministic virtual TSC. `CR4.PCE = 0` traps `RDPMC`; `#UD` traps AMD `RDPRU`. No vDSO (`AT_SYSINFO_EHDR` omitted), so `clock_gettime`, `gettimeofday`, `time`, and `nanosleep` route through the deterministic virtual clock (virtual sleeps complete instantaneously without wall-clock waiting).
   - **Randomness & Hardware RNG**: Deterministic `xoshiro256**` PRNG seeded via `--seed` mocks `getrandom(2)`, `/dev/urandom`, `/dev/random`, `/dev/hwrng`, `/proc/sys/kernel/random/uuid`, and `AT_RANDOM`. `RDRAND`/`RDSEED` are masked in `CPUID` **and** automatically scanned & patched in all executable pages (`src/x86_patch.c`, carefully distinguishing `RDSEED` from `RDPID`) so even binaries executing inline `rdrand`/`rdseed` without checking CPUID are 100% deterministically mocked on AMD SVM.
   - **Zero-Skid Deterministic Multithreading**: Full Linux thread support (`clone`, `clone3`, `futex` wait/wake/bitset/requeue/wake_op, TLS `FS_BASE`, per-thread `XSAVE` FPU/SSE/AVX state, `pthread_mutex`, `pthread_cond`, `pthread_barrier`, atomic spinlocks). When multiple threads are runnable, uses AMD hardware `ExRetCond` (`0xD1` Retired Conditional Branches, `USR=1, OS=0`) LAPIC PMI overflow combined with a pure Ring-0 `#DB` single-step landing phase (zero VMEXITs) to preempt at the **exact** deterministic branch count with zero skid. Single-threaded execution pays zero PMU overhead.
-  - **Deterministic Memory & OS State**: Fixed non-ASLR memory layout, deterministic PID/TID (`1000+`), sanitized environment & `uname`, deterministic `stat`/`statx` metadata, copy-on-write in-memory virtual filesystem (guest writes never touch host disk and roll back cleanly on snapshot reload), `CR4.UMIP = 1` traps `SGDT`/`SIDT`/`SLDT`/`SMSW`/`STR`.
-- **Ultra-Fast Snapshot Fuzzing (~48,000–50,000 exec/s on 1 vCPU)**:
+  - **Deterministic Memory, Networking, `io_uring`, & VFS**:
+    - Fixed non-ASLR memory layout, split KVM memory slots around the 3–4 GiB x86 MMIO/LAPIC hole (supporting multi-GiB guests like Solana Agave with `--ram 4096`), physical page recycling on `munmap`, coherent `MAP_SHARED` file mappings.
+    - Deterministic PID/TID (`1000+`), sanitized environment (`--env K=V`) & `uname`, deterministic `stat`/`statx` metadata, isolated in-memory VFS (directories, `getdents64`, `rename`/`unlink`/`truncate`, `/proc/*`, `/sys/*`, `/etc/hosts`, zero writes to host disk and zero host `/proc`/`/sys`/`/dev`/`/tmp` leakage), `CR4.UMIP = 1`.
+    - Deterministic virtual loopback networking (`src/net.c`: `AF_INET`/`AF_INET6` UDP & TCP, `AF_UNIX` `socketpair`, `sendmmsg`/`recvmmsg`, `epoll` including edge-triggered `EPOLLET`, `timerfd`) and synchronous deterministic `io_uring` (`src/iouring.c`).
+- **Ultra-Fast Snapshot Fuzzing (~46,000–49,000 exec/s on 1 vCPU)**:
   - Uses **x86_64 hardware guest `PTE_D` dirty-bit tracking** + a compact host-VMM dirty-page tracker (`host_dirty_gfns`) + a ~30 ns Ring-0 `CR3` TLB reload instead of expensive KVM NPT write-protect `#NPF` faults.
   - Restores CPU registers via zero-ioctl `KVM_SYNC_X86_REGS`.
   - Supports snapshot triggers by ELF symbol (`--snap-sym`), virtual address (`--snap-addr`), or automatically right before the first `read(0, ...)` (`--snap-on-stdin`).
@@ -44,6 +47,9 @@ make test
 
 # Run built-in deterministic snapshot fuzzer (100k iterations)
 ./build/dethv --snap-on-stdin --fuzz 100000 --fuzz-seed 0x1337 --fuzz-max-len 16 ./build/fuzz_target_dyn
+# Run an unmodified Solana Agave local_cluster test 100% deterministically (4 GiB RAM)
+./build/dethv --ram 4096 --quantum 200000 --env RUST_LOG=info --verify 3 -- \
+  ./agave/target/release/deps/local_cluster-* test_local_cluster_start_and_exit --exact --nocapture --test-threads=1
 ```
 
 ## Architecture
@@ -53,13 +59,15 @@ make test
 | `include/dethv.h` | Public C API for embedding DetHV in custom fuzzers |
 | `include/guest_shared.h` | Shared Ring-0 <-> VMM trap frame, vTSC, PMU, TLB-flush state |
 | `src/guest_stub.S` | Ring-0 guest kernel (`SYSCALL`, fast Ring-0 `RDTSC`/`RDTSCP`, zero-skid PMI + `#DB` landing, `CR3` flush) |
-| `src/vmm.c` | KVM VM/vCPU setup, deterministic CPUID, XSAVE, exception handling, run loop |
-| `src/mmu.c` | 4-level x86_64 guest page tables, VMA tracking, demand paging, host-dirty tracking |
-| `src/x86_patch.c` | Executable-page `RDRAND`/`RDSEED` patcher + snapshot & one-shot coverage breakpoints |
+| `src/vmm.c` | KVM VM/vCPU setup, split 3–4 GiB MMIO hole RAM slots, deterministic CPUID, XSAVE, exception handling, run loop |
+| `src/mmu.c` | 4-level x86_64 guest page tables, VMA tracking, demand paging, page free-list, `MAP_SHARED` sync, host-dirty tracking |
+| `src/x86_patch.c` | O(1) hash-indexed `RDRAND`/`RDSEED` patcher + snapshot & one-shot coverage breakpoints |
 | `src/elf_loader.c` | Static & dynamic (`PT_INTERP`) ELF loader, symbol parser, deterministic stack & `auxv` |
 | `src/determinism.c` | `xoshiro256**` PRNG, deterministic virtual clock, state hashing |
-| `src/scheduler.c` | Single-vCPU deterministic multithreaded scheduler (`clone`/`clone3`, `futex`, `ExRetCond` PMU) |
-| `src/vfs.c` | Virtual FD table, `/dev/urandom`, `/proc/*`, pipes, eventfd, COW virtual files, fast restore |
+| `src/scheduler.c` | Single-vCPU deterministic multithreaded scheduler (`clone`/`clone3`, `futex`, `ExRetCond` PMU, I/O blocking) |
+| `src/vfs.c` | Virtual FD table, isolated in-memory VFS + directories, `/dev/urandom`, `/proc/*`, `/sys/*`, pipes, eventfd, fast restore |
+| `src/net.c` | Deterministic virtual loopback UDP/TCP/Unix sockets, `epoll` (level & `EPOLLET`), `timerfd` |
+| `src/iouring.c` | Deterministic synchronous virtual `io_uring` (`setup`/`enter`/`register` + ring `mmap`) |
 | `src/syscall.c` | x86_64 Linux syscall emulation |
 | `src/snapshot.c` | Zero-VMEXIT `PTE_D` snapshot take/restore + `.dhvs` disk serialization |
 | `src/main.c` | CLI runner, determinism verifier, snapshot benchmark, built-in snapshot fuzzer |

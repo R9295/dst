@@ -43,24 +43,34 @@ stub_enter_user:
     cmpq $0, GS_OFF_PMU_ARMED(%rax)
     je .Lno_pmu
 
+    /* In exact landing phase: IF=0, TF=1 (counter already stopped on PMI!) */
+    cmpq $0, GS_OFF_PMU_IN_LANDING(%rax)
+    jne .Larm_landing
+
+    /* Fast path: if PMU is already programmed & running in HW for this thread,
+     * skip ALL wrmsr calls! (ExRetCond USR=1/OS=0 automatically froze in Ring 0!) */
+    cmpq $0, GS_OFF_PMU_NEED_PROG(%rax)
+    je .Lpmu_already_running
+
+    movq $0, GS_OFF_PMU_NEED_PROG(%rax)
+    movq %rax, %rbx
+
     /* One-time LAPIC init for LVT PERFMON -> vector 0xFE */
-    cmpq $0, GS_OFF_LAPIC_INIT_DONE(%rax)
+    cmpq $0, GS_OFF_LAPIC_INIT_DONE(%rbx)
     jne .Llapic_ready
     movabsq $GUEST_LAPIC_VADDR, %rdx
     movl $0x1FF, 0x0F0(%rdx)                /* LAPIC SVR */
     movl $DETHV_PMI_VECTOR, 0x340(%rdx)     /* LVT PERFMON */
-    movq $1, GS_OFF_LAPIC_INIT_DONE(%rax)
+    movq $1, GS_OFF_LAPIC_INIT_DONE(%rbx)
 .Llapic_ready:
-    /* Stop PERF_CTL0 before reprogramming */
+    /* Stop PERF_CTL0 only if currently enabled */
+    cmpq $0, GS_OFF_PMU_HW_ON(%rbx)
+    je .Lprog_ctr
     movl $0xC0010000, %ecx
     xorl %eax, %eax
     xorl %edx, %edx
     wrmsr
-
-    LOAD_SHARED %rbx
-    cmpq $0, GS_OFF_PMU_IN_LANDING(%rbx)
-    jne .Larm_landing
-
+.Lprog_ctr:
     /* Program PERF_CTR0 = pmu_init_ctr (48-bit) */
     movl $0xC0010004, %ecx
     movl GS_OFF_PMU_INIT_CTR(%rbx), %eax
@@ -72,21 +82,35 @@ stub_enter_user:
     movl GS_OFF_PMU_CTL_PMI(%rbx), %eax
     movl GS_OFF_PMU_CTL_PMI+4(%rbx), %edx
     wrmsr
+    movq $1, GS_OFF_PMU_HW_ON(%rbx)
+    movq %rbx, %rax
 
+.Lpmu_already_running:
     /* Enable IF=1, TF=0 */
-    orq  $0x200, GS_OFF_RFLAGS(%rbx)
-    andq $~0x100, GS_OFF_RFLAGS(%rbx)
+    orq  $0x200, GS_OFF_RFLAGS(%rax)
+    andq $~0x100, GS_OFF_RFLAGS(%rax)
     jmp .Ldo_iret
 
 .Larm_landing:
     /* Exact landing phase: IF=0, TF=1 */
-    movq GS_OFF_RIP(%rbx), %rcx
-    movq %rcx, GS_OFF_PMU_PREV_RIP(%rbx)
-    andq $~0x200, GS_OFF_RFLAGS(%rbx)
-    orq  $0x100, GS_OFF_RFLAGS(%rbx)
+    movq GS_OFF_RIP(%rax), %rcx
+    movq %rcx, GS_OFF_PMU_PREV_RIP(%rax)
+    andq $~0x200, GS_OFF_RFLAGS(%rax)
+    orq  $0x100, GS_OFF_RFLAGS(%rax)
     jmp .Ldo_iret
 
 .Lno_pmu:
+    /* Turn off PERF_CTL0 ONLY if it was enabled in HW */
+    cmpq $0, GS_OFF_PMU_HW_ON(%rax)
+    je .Lno_pmu_flags
+    movq %rax, %rbx
+    movl $0xC0010000, %ecx
+    xorl %eax, %eax
+    xorl %edx, %edx
+    wrmsr
+    movq $0, GS_OFF_PMU_HW_ON(%rbx)
+    movq %rbx, %rax
+.Lno_pmu_flags:
     andq $~0x300, GS_OFF_RFLAGS(%rax)
 
 .Ldo_iret:
@@ -145,27 +169,9 @@ stub_syscall:
     movq %r15, %gs:GS_OFF_R15
     swapgs
 
+    /* ZERO wrmsr/rdmsr on syscall! ExRetCond (USR=1, OS=0) automatically
+     * froze on CPL 3->0 transition and resumes seamlessly on IRETQ! */
     LOAD_SHARED %rbx
-    cmpq $0, GS_OFF_PMU_ARMED(%rbx)
-    je .Lsys_exit
-    cmpq $0, GS_OFF_PMU_IN_LANDING(%rbx)
-    jne .Lsys_in_landing
-
-    movl $0xC0010000, %ecx
-    xorl %eax, %eax
-    xorl %edx, %edx
-    wrmsr
-    movl $0xC0010004, %ecx
-    rdmsr
-    movl %eax, GS_OFF_PMU_EXIT_CTR(%rbx)
-    movl %edx, GS_OFF_PMU_EXIT_CTR+4(%rbx)
-    jmp .Lsys_exit
-
-.Lsys_in_landing:
-    movq $-1, GS_OFF_PMU_EXIT_CTR(%rbx)
-    movq $0, GS_OFF_PMU_IN_LANDING(%rbx)
-
-.Lsys_exit:
     movq $DETHV_EXIT_SYSCALL, GS_OFF_EXIT_REASON(%rbx)
     movb $DETHV_EXIT_SYSCALL, %al
     outb %al, $DETHV_HC_PORT
@@ -188,9 +194,13 @@ stub_isr_pmi:
     xorl %edx, %edx
     wrmsr
 
-    /* LAPIC EOI */
+    LOAD_SHARED %rbx
+    movq $0, GS_OFF_PMU_HW_ON(%rbx)
+
+    /* LAPIC EOI & unmask LVT PERFMON (x86 LAPIC auto-masks on PMI) */
     movabsq $GUEST_LAPIC_VADDR, %rax
     movl $0, 0x0B0(%rax)
+    movl $DETHV_PMI_VECTOR, 0x340(%rax)
 
     /* Read PERF_CTR0 */
     movl $0xC0010004, %ecx
@@ -198,7 +208,6 @@ stub_isr_pmi:
     shlq $32, %rdx
     orq  %rax, %rdx
 
-    LOAD_SHARED %rbx
     movq %rdx, GS_OFF_PMU_EXIT_CTR(%rbx)
 
     /* Guard against spurious pre-overflow PMI (bit 47 set) */
@@ -232,6 +241,7 @@ stub_isr_pmi:
     movl GS_OFF_PMU_CTL_PMI(%rbx), %eax
     movl GS_OFF_PMU_CTL_PMI+4(%rbx), %edx
     wrmsr
+    movq $1, GS_OFF_PMU_HW_ON(%rbx)
     popq %rdx
     popq %rcx
     popq %rbx
@@ -506,26 +516,6 @@ stub_isr_common:
     testq $3, 8(%rsp)
     jz .Lring0_panic
 
-    cmpq $0, GS_OFF_PMU_ARMED(%rax)
-    je .Lexc_exit
-    cmpq $0, GS_OFF_PMU_IN_LANDING(%rax)
-    jne .Lexc_in_landing
-    movq %rax, %rbx
-    movl $0xC0010000, %ecx
-    xorl %eax, %eax
-    xorl %edx, %edx
-    wrmsr
-    movl $0xC0010004, %ecx
-    rdmsr
-    movl %eax, GS_OFF_PMU_EXIT_CTR(%rbx)
-    movl %edx, GS_OFF_PMU_EXIT_CTR+4(%rbx)
-    movq %rbx, %rax
-    jmp .Lexc_exit
-
-.Lexc_in_landing:
-    movq $-1, GS_OFF_PMU_EXIT_CTR(%rax)
-
-.Lexc_exit:
     movq $DETHV_EXIT_EXCEPTION, GS_OFF_EXIT_REASON(%rax)
     movb $DETHV_EXIT_EXCEPTION, %al
     outb %al, $DETHV_HC_PORT

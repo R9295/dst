@@ -5,7 +5,7 @@
 #include <sys/ioctl.h>
 
 #define DETHV_SNAP_MAGIC   0x53564844U /* "DHVS" */
-#define DETHV_SNAP_VERSION 1U
+#define DETHV_SNAP_VERSION 2U
 
 static uint64_t g_next_snap_id = 1;
 
@@ -23,11 +23,6 @@ static void reset_host_dirty(dethv_vm_t *vm) {
     vm->dirty_ring_overflow = false;
 }
 
-/*
- * Walk the 4-level guest page tables inside snap->mem, clear PTE_D (bit 6)
- * on every writable leaf PTE (in both snap->mem and optionally live_mem),
- * and build the compact snap->wptes[] list for zero-VMEXIT dirty-page resets!
- */
 static int build_wpte_table(dethv_snapshot_t *snap, uint8_t *live_mem) {
     uint32_t cap = 1024;
     snap->wptes = malloc(cap * sizeof(snap_wpte_t));
@@ -60,11 +55,9 @@ static int build_wpte_table(dethv_snapshot_t *snap, uint8_t *live_mem) {
                     uint64_t e = pt[i1];
                     if ((e & (PTE_P | PTE_W)) != (PTE_P | PTE_W)) continue;
                     uint64_t pa = e & PTE_ADDR_MASK;
-                    /* Skip LAPIC MMIO and guest_shared_t (handled explicitly) */
                     if (pa >= snap->phys_used || pa == GUEST_SHARED_PHYS) continue;
 
-                    uint32_t pte_byte_off = (uint32_t)(pt_off + i1 * 8);
-                    /* Clear PTE_D in both snapshot PT and live PT! */
+                    uint64_t pte_byte_off = pt_off + i1 * 8;
                     pt[i1] = e & ~PTE_D;
                     if (live_mem) {
                         *(uint64_t *)(live_mem + pte_byte_off) &= ~PTE_D;
@@ -78,7 +71,7 @@ static int build_wpte_table(dethv_snapshot_t *snap, uint8_t *live_mem) {
                     }
                     snap->wptes[snap->num_wptes++] = (snap_wpte_t){
                         .pte_offset  = pte_byte_off,
-                        .phys_offset = (uint32_t)pa
+                        .phys_offset = pa
                     };
                 }
             }
@@ -97,20 +90,14 @@ dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm) {
     snap->ram_size  = vm->ram_size;
     snap->phys_used = vm->mmu.next_phys;
 
-    /* Copy only used guest physical memory [0 .. phys_used) */
     snap->mem = malloc(snap->phys_used);
-    if (!snap->mem) {
-        free(snap);
-        return NULL;
-    }
+    if (!snap->mem) { free(snap); return NULL; }
     memcpy(snap->mem, vm->mem, snap->phys_used);
 
-    /* Ensure restored guest_shared_t always triggers a 30ns Ring-0 CR3 TLB flush! */
     guest_shared_t *snap_shared = (guest_shared_t *)(snap->mem + GUEST_SHARED_PHYS);
     snap_shared->flush_tlb = 1;
-    vm->shared->flush_tlb = 1;
+    vm->shared->flush_tlb  = 1;
 
-    /* Save full architectural vCPU state */
     if (ioctl(vm->vcpu_fd, KVM_GET_REGS, &snap->regs) < 0 ||
         ioctl(vm->vcpu_fd, KVM_GET_SREGS, &snap->sregs) < 0 ||
         ioctl(vm->vcpu_fd, KVM_GET_VCPU_EVENTS, &snap->events) < 0 ||
@@ -118,18 +105,20 @@ dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm) {
         ioctl(vm->vcpu_fd, KVM_GET_XCRS, &snap->xcrs) < 0 ||
         ioctl(vm->vcpu_fd, KVM_GET_LAPIC, &snap->lapic) < 0) {
         perror("dethv_snapshot_take KVM_GET_*");
-        free(snap->mem);
-        free(snap);
+        dethv_snapshot_free(snap);
         return NULL;
     }
 
-    /* Save deterministic VMM subsystems */
     snap->det             = vm->det;
     snap->mmu             = vm->mmu;
     snap->sched           = vm->sched;
-    snap->patches         = vm->patches;
     snap->syms            = vm->syms;
     snap->current_fs_base = vm->current_fs_base;
+
+    if (x86_patch_clone(&snap->patches, &vm->patches) < 0) {
+        dethv_snapshot_free(snap);
+        return NULL;
+    }
 
     for (int i = 0; i < DETHV_MAX_FDS; i++) snap->vfs.fds[i].host_fd = -1;
     if (vfs_clone(&snap->vfs, &vm->vfs) < 0) {
@@ -137,35 +126,26 @@ dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm) {
         return NULL;
     }
 
-    /* Build compact writable-PTE list & clear hardware PTE_D bits! */
     if (build_wpte_table(snap, vm->mem) < 0) {
         dethv_snapshot_free(snap);
         return NULL;
     }
 
     reset_host_dirty(vm);
-    vm->loaded_snap_id = snap->id;
-    vm->lapic_touched = false;
+    vm->loaded_snap_id  = snap->id;
+    vm->snap_phys_floor = snap->phys_used;
+    vm->phys_free_count = 0;
+    vm->lapic_touched   = false;
     vm->sregs_changed_since_snap = false;
-    vm->vfs.fds_dirty = false;
-    vm->vfs.pipes_dirty = false;
+    vm->vfs.fds_dirty    = false;
+    vm->vfs.pipes_dirty  = false;
     vm->vfs.vfiles_dirty = false;
-    vm->vfs.cwd_dirty = false;
+    vm->vfs.cwd_dirty    = false;
     vm->sched.sigactions_dirty = false;
 
     return snap;
 }
 
-/*
- * Ultra-fast ZERO-VMEXIT-FAULT snapshot restore!
- *
- * Uses x86_64 hardware PTE_D (dirty bit in guest page tables) + Ring-0 CR3
- * reload (~30ns) instead of KVM NPT write-protect faults!
- * Restores:
- *   1. Guest CPU writes detected via hardware PTE_D on compact writable-PTE list
- *   2. Host VMM writes detected via vm->host_dirty_gfns (read/getrandom/mmap/PTs)
- *   3. Compact active VMM state (~1-2 KB) + zero-ioctl SYNC_REGS!
- */
 int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
     if (!vm || !snap || snap->magic != DETHV_SNAP_MAGIC) return -1;
     if (snap->phys_used > vm->ram_size) return -1;
@@ -176,7 +156,6 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
                       !vm->host_dirty_overflow);
 
     if (fast_path) {
-        /* 1. Restore all pages dirtied by guest CPU via hardware PTE_D (ZERO #NPF VMEXITs!) */
         const snap_wpte_t *wptes = snap->wptes;
         uint32_t nw = snap->num_wptes;
         uint8_t *live = vm->mem;
@@ -185,13 +164,12 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
             uint64_t *pte = (uint64_t *)(live + wptes[i].pte_offset);
             if (*pte & PTE_D) {
                 *pte &= ~PTE_D;
-                uint32_t poff = wptes[i].phys_offset;
+                uint64_t poff = wptes[i].phys_offset;
                 memcpy(live + poff, base + poff, PAGE_SIZE);
                 dirty_pages++;
             }
         }
 
-        /* 2. Restore all pages dirtied directly by host VMM (syscalls, page tables, mprotect) */
         for (uint32_t i = 0; i < vm->host_dirty_count; i++) {
             uint64_t gfn = vm->host_dirty_gfns[i];
             uint64_t off = gfn * PAGE_SIZE;
@@ -206,15 +184,12 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         dirty_pages += (uint64_t)vm->host_dirty_count;
         vm->host_dirty_count = 0;
 
-        /* 3. Restore compact guest_shared_t (has flush_tlb=1!) & zero newly allocated frames */
         memcpy(live + GUEST_SHARED_PHYS, base + GUEST_SHARED_PHYS, sizeof(guest_shared_t));
         if (vm->mmu.next_phys > snap->phys_used) {
             memset(live + snap->phys_used, 0, vm->mmu.next_phys - snap->phys_used);
         }
+        vm->phys_free_count = 0;
 
-        /* Restore vCPU state via zero-ioctl SYNC_REGS!
-         * Note: Ring-0 stub_enter_user executes `mov cr3, rcx; mov rcx, cr3` (~30ns)
-         * to flush guest TLB so hardware PTE_D triggers cleanly on next iteration! */
         vm->kvm_run->s.regs.regs   = snap->regs;
         vm->kvm_run->s.regs.events = snap->events;
         vm->kvm_run->kvm_valid_regs = KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS | KVM_SYNC_X86_EVENTS;
@@ -229,10 +204,12 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         if (ioctl(vm->vcpu_fd, KVM_SET_XSAVE, &snap->xsave) < 0) return -1;
         if (vm->lapic_touched) {
             ioctl(vm->vcpu_fd, KVM_SET_LAPIC, &snap->lapic);
+            /* Force Ring-0 stub to cleanly disable/reprogram HW PERF_CTL0 if it was left running */
+            vm->shared->pmu_hw_on = 1;
+            vm->shared->pmu_need_prog = 1;
             vm->lapic_touched = false;
         }
 
-        /* Compact VMM state restore */
         vm->det = snap->det;
 
         vm->mmu.pml4_phys    = snap->mmu.pml4_phys;
@@ -272,6 +249,8 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
             dt->futex_bitset     = st->futex_bitset;
             dt->wake_time_ns     = st->wake_time_ns;
             dt->has_timeout      = st->has_timeout;
+            dt->io_waiting       = st->io_waiting;
+            dt->io_timed_out     = st->io_timed_out;
             dt->pending_ret      = st->pending_ret;
             dt->has_pending_ret  = st->has_pending_ret;
         } else if (slots > 0) {
@@ -282,9 +261,11 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
             vm->sched.sigactions_dirty = false;
         }
 
+        /* Restore compact patch entries (preserving coverage hit counter) */
         uint64_t saved_cov = vm->patches.cov_hits;
-        vm->patches.count = snap->patches.count;
-        if (snap->patches.count > 0) {
+        if (vm->patches.count != snap->patches.count) {
+            x86_patch_clone(&vm->patches, &snap->patches);
+        } else if (snap->patches.count > 0) {
             memcpy(vm->patches.entries, snap->patches.entries, snap->patches.count * sizeof(patch_entry_t));
         }
         vm->patches.cov_hits = saved_cov > snap->patches.cov_hits ? saved_cov : snap->patches.cov_hits;
@@ -297,7 +278,6 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
 
         if (vfs_restore_fast(&vm->vfs, &snap->vfs) < 0) return -1;
     } else {
-        /* Cold restore (loading snapshot from disk into a fresh VM, or after overflow) */
         memcpy(vm->mem, snap->mem, snap->phys_used);
         if (vm->mmu.next_phys > snap->phys_used) {
             memset(vm->mem + snap->phys_used, 0, vm->mmu.next_phys - snap->phys_used);
@@ -306,8 +286,10 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         reset_host_dirty(vm);
         ioctl(vm->vcpu_fd, KVM_SET_XCRS, &snap->xcrs);
         ioctl(vm->vcpu_fd, KVM_SET_LAPIC, &snap->lapic);
-        vm->loaded_snap_id = snap->id;
-        vm->lapic_touched = false;
+        vm->loaded_snap_id  = snap->id;
+        vm->snap_phys_floor = snap->phys_used;
+        vm->phys_free_count = 0;
+        vm->lapic_touched   = false;
         vm->sregs_changed_since_snap = false;
         dirty_pages = snap->phys_used / PAGE_SIZE;
 
@@ -322,7 +304,7 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         vm->mmu             = snap->mmu;
         vm->sched           = snap->sched;
         uint64_t saved_cov  = vm->patches.cov_hits;
-        vm->patches         = snap->patches;
+        x86_patch_clone(&vm->patches, &snap->patches);
         if (saved_cov > vm->patches.cov_hits) vm->patches.cov_hits = saved_cov;
         vm->syms            = snap->syms;
         vm->current_fs_base = snap->current_fs_base;
@@ -341,6 +323,7 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
 void dethv_snapshot_free(dethv_snapshot_t *snap) {
     if (!snap) return;
     vfs_destroy(&snap->vfs);
+    x86_patch_destroy(&snap->patches);
     free(snap->wptes);
     free(snap->mem);
     free(snap);
@@ -360,7 +343,6 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) { perror("fopen snapshot save"); return -1; }
 
-    /* Fixed header & metadata */
     if (write_all(fp, &snap->magic, sizeof(snap->magic)) ||
         write_all(fp, &snap->version, sizeof(snap->version)) ||
         write_all(fp, &snap->ram_size, sizeof(snap->ram_size)) ||
@@ -374,16 +356,17 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
         write_all(fp, &snap->det, sizeof(snap->det)) ||
         write_all(fp, &snap->mmu, sizeof(snap->mmu)) ||
         write_all(fp, &snap->sched, sizeof(snap->sched)) ||
-        write_all(fp, &snap->patches, sizeof(snap->patches)) ||
+        write_all(fp, &snap->patches.count, sizeof(snap->patches.count)) ||
+        write_all(fp, &snap->patches.cov_hits, sizeof(snap->patches.cov_hits)) ||
+        write_all(fp, snap->patches.entries, snap->patches.count * sizeof(patch_entry_t)) ||
         write_all(fp, &snap->syms, sizeof(snap->syms)) ||
         write_all(fp, &snap->current_fs_base, sizeof(snap->current_fs_base))) {
         fclose(fp);
         return -1;
     }
 
-    /* VFS scalar state + buffers */
-    if (write_all(fp, snap->vfs.fds, sizeof(snap->vfs.fds)) ||
-        write_all(fp, snap->vfs.pipes, sizeof(snap->vfs.pipes)) ||
+    if (write_all(fp, &snap->vfs.max_fd_used, sizeof(snap->vfs.max_fd_used)) ||
+        write_all(fp, snap->vfs.fds, snap->vfs.max_fd_used * sizeof(vfd_t)) ||
         write_all(fp, snap->vfs.cwd, sizeof(snap->vfs.cwd)) ||
         write_all(fp, snap->vfs.exe_path, sizeof(snap->vfs.exe_path)) ||
         write_all(fp, &snap->vfs.umask_val, sizeof(snap->vfs.umask_val)) ||
@@ -393,18 +376,20 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
         write_all(fp, &snap->vfs.stdout_len, sizeof(snap->vfs.stdout_len)) ||
         write_all(fp, snap->vfs.stdout_buf, snap->vfs.stdout_len) ||
         write_all(fp, &snap->vfs.stderr_len, sizeof(snap->vfs.stderr_len)) ||
-        write_all(fp, snap->vfs.stderr_buf, snap->vfs.stderr_len)) {
+        write_all(fp, snap->vfs.stderr_buf, snap->vfs.stderr_len) ||
+        write_all(fp, &snap->vfs.max_vfile_used, sizeof(snap->vfs.max_vfile_used))) {
         fclose(fp);
         return -1;
     }
 
-    /* VFS overlay files */
-    for (int i = 0; i < DETHV_MAX_VFILES; i++) {
+    for (uint32_t i = 0; i < snap->vfs.max_vfile_used; i++) {
         const vfile_t *vf = &snap->vfs.vfiles[i];
         uint8_t used = vf->used ? 1 : 0;
         if (write_all(fp, &used, 1)) { fclose(fp); return -1; }
         if (used) {
-            if (write_all(fp, vf->path, sizeof(vf->path)) ||
+            uint8_t is_dir = vf->is_dir ? 1 : 0;
+            if (write_all(fp, &is_dir, 1) ||
+                write_all(fp, vf->path, sizeof(vf->path)) ||
                 write_all(fp, &vf->mode, sizeof(vf->mode)) ||
                 write_all(fp, &vf->len, sizeof(vf->len)) ||
                 write_all(fp, vf->data, vf->len)) {
@@ -414,7 +399,6 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
         }
     }
 
-    /* Guest physical memory [0 .. phys_used) */
     if (write_all(fp, snap->mem, snap->phys_used)) {
         fclose(fp);
         return -1;
@@ -446,38 +430,45 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
         read_all(fp, &snap->det, sizeof(snap->det)) ||
         read_all(fp, &snap->mmu, sizeof(snap->mmu)) ||
         read_all(fp, &snap->sched, sizeof(snap->sched)) ||
-        read_all(fp, &snap->patches, sizeof(snap->patches)) ||
+        read_all(fp, &snap->patches.count, sizeof(snap->patches.count)) ||
+        read_all(fp, &snap->patches.cov_hits, sizeof(snap->patches.cov_hits)) ||
+        snap->patches.count > DETHV_MAX_PATCHES) {
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
+    }
+
+    snap->patches.cap = snap->patches.count < 1024 ? 1024 : snap->patches.count;
+    snap->patches.entries = calloc(snap->patches.cap, sizeof(patch_entry_t));
+    if (!snap->patches.entries ||
+        read_all(fp, snap->patches.entries, snap->patches.count * sizeof(patch_entry_t)) ||
         read_all(fp, &snap->syms, sizeof(snap->syms)) ||
         read_all(fp, &snap->current_fs_base, sizeof(snap->current_fs_base))) {
-        fclose(fp);
-        dethv_snapshot_free(snap);
-        return NULL;
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
+    x86_patch_rebuild_ht(&snap->patches);
 
+    snap->vfs.pipes      = calloc(DETHV_MAX_PIPES,  sizeof(vpipe_t));
+    snap->vfs.vfiles     = calloc(DETHV_MAX_VFILES, sizeof(vfile_t));
     snap->vfs.stdout_buf = calloc(1, DETHV_OUT_CAP);
     snap->vfs.stderr_buf = calloc(1, DETHV_OUT_CAP);
-    if (!snap->vfs.stdout_buf || !snap->vfs.stderr_buf) {
-        fclose(fp);
-        dethv_snapshot_free(snap);
-        return NULL;
+    if (!snap->vfs.pipes || !snap->vfs.vfiles || !snap->vfs.stdout_buf || !snap->vfs.stderr_buf) {
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
 
-    if (read_all(fp, snap->vfs.fds, sizeof(snap->vfs.fds)) ||
-        read_all(fp, snap->vfs.pipes, sizeof(snap->vfs.pipes)) ||
+    if (read_all(fp, &snap->vfs.max_fd_used, sizeof(snap->vfs.max_fd_used)) ||
+        snap->vfs.max_fd_used > DETHV_MAX_FDS ||
+        read_all(fp, snap->vfs.fds, snap->vfs.max_fd_used * sizeof(vfd_t)) ||
         read_all(fp, snap->vfs.cwd, sizeof(snap->vfs.cwd)) ||
         read_all(fp, snap->vfs.exe_path, sizeof(snap->vfs.exe_path)) ||
         read_all(fp, &snap->vfs.umask_val, sizeof(snap->vfs.umask_val)) ||
         read_all(fp, &snap->vfs.stdin_len, sizeof(snap->vfs.stdin_len)) ||
         read_all(fp, &snap->vfs.stdin_pos, sizeof(snap->vfs.stdin_pos))) {
-        fclose(fp);
-        dethv_snapshot_free(snap);
-        return NULL;
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
-    /* Clear stale host_fds (they will be reopened cleanly on restore!) */
     for (int i = 0; i < DETHV_MAX_FDS; i++) snap->vfs.fds[i].host_fd = -1;
 
     if (snap->vfs.stdin_len > 0) {
         snap->vfs.stdin_buf = malloc(snap->vfs.stdin_len);
+        snap->vfs.stdin_cap = snap->vfs.stdin_len;
         if (!snap->vfs.stdin_buf || read_all(fp, snap->vfs.stdin_buf, snap->vfs.stdin_len)) {
             fclose(fp); dethv_snapshot_free(snap); return NULL;
         }
@@ -487,21 +478,26 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
         read_all(fp, snap->vfs.stdout_buf, snap->vfs.stdout_len) ||
         read_all(fp, &snap->vfs.stderr_len, sizeof(snap->vfs.stderr_len)) ||
         snap->vfs.stderr_len > DETHV_OUT_CAP ||
-        read_all(fp, snap->vfs.stderr_buf, snap->vfs.stderr_len)) {
+        read_all(fp, snap->vfs.stderr_buf, snap->vfs.stderr_len) ||
+        read_all(fp, &snap->vfs.max_vfile_used, sizeof(snap->vfs.max_vfile_used)) ||
+        snap->vfs.max_vfile_used > DETHV_MAX_VFILES) {
         fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
 
-    for (int i = 0; i < DETHV_MAX_VFILES; i++) {
+    for (uint32_t i = 0; i < snap->vfs.max_vfile_used; i++) {
         uint8_t used = 0;
         if (read_all(fp, &used, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
         if (used) {
             vfile_t *vf = &snap->vfs.vfiles[i];
             vf->used = true;
-            if (read_all(fp, vf->path, sizeof(vf->path)) ||
+            uint8_t is_dir = 0;
+            if (read_all(fp, &is_dir, 1) ||
+                read_all(fp, vf->path, sizeof(vf->path)) ||
                 read_all(fp, &vf->mode, sizeof(vf->mode)) ||
                 read_all(fp, &vf->len, sizeof(vf->len))) {
                 fclose(fp); dethv_snapshot_free(snap); return NULL;
             }
+            vf->is_dir = (is_dir != 0);
             if (vf->len > 0) {
                 vf->data = malloc(vf->len);
                 vf->cap = vf->len;
@@ -514,23 +510,16 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
 
     snap->mem = malloc(snap->phys_used);
     if (!snap->mem || read_all(fp, snap->mem, snap->phys_used)) {
-        fclose(fp);
-        dethv_snapshot_free(snap);
-        return NULL;
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
 
-    /* Rebuild writable-PTE dirty tracking table for disk-loaded snapshot too! */
     if (build_wpte_table(snap, NULL) < 0) {
-        fclose(fp);
-        dethv_snapshot_free(snap);
-        return NULL;
+        fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
 
     fclose(fp);
     return snap;
 }
-
-/* ==================== One-Shot Symbol Coverage Breakpoints ==================== */
 
 int dethv_cov_install_symbols(dethv_vm_t *vm, dethv_snapshot_t *snap) {
     int installed = 0;
@@ -543,15 +532,12 @@ int dethv_cov_install_symbols(dethv_vm_t *vm, dethv_snapshot_t *snap) {
         if (!pa || (pte & PTE_NX)) continue;
         if (x86_patch_find(&vm->patches, addr)) continue;
         if (x86_patch_add_bp(vm, addr, PATCH_COV_BP) == 0) {
-            /* Mirror breakpoint into snapshot memory too so resets preserve active breakpoints! */
-            if (snap && pa < snap->phys_used) {
-                snap->mem[pa] = 0xCC;
-            }
+            if (snap && pa < snap->phys_used) snap->mem[pa] = 0xCC;
             installed++;
         }
     }
     if (snap) {
-        snap->patches = vm->patches;
+        x86_patch_clone(&snap->patches, &vm->patches);
         vm->active_cov_snap = snap;
     }
     return installed;

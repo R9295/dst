@@ -1,0 +1,116 @@
+#ifndef DETHV_H
+#define DETHV_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct dethv_vm dethv_vm_t;
+typedef struct dethv_snapshot dethv_snapshot_t;
+
+typedef enum {
+    DETHV_STOP_NONE = 0,
+    DETHV_STOP_EXITED,          /* Normal exit / exit_group */
+    DETHV_STOP_CRASH_SEGV,      /* SIGSEGV (#PF / #GP) */
+    DETHV_STOP_CRASH_ILL,       /* SIGILL (#UD) */
+    DETHV_STOP_CRASH_FPE,       /* SIGFPE (#DE / #XF) */
+    DETHV_STOP_CRASH_ABRT,      /* SIGABRT (tgkill/kill/abort) */
+    DETHV_STOP_CRASH_BUS,       /* SIGBUS (#AC / #SS) */
+    DETHV_STOP_CRASH_TRAP,      /* SIGTRAP (unhandled int3 / #DB) */
+    DETHV_STOP_SNAPSHOT,        /* Hit configured snapshot trigger */
+    DETHV_STOP_TIMEOUT,         /* Exceeded deterministic syscall/branch budget */
+    DETHV_STOP_DEADLOCK,        /* All threads blocked with no wakeups */
+    DETHV_STOP_ERROR            /* Internal hypervisor error */
+} dethv_stop_reason_t;
+
+typedef struct {
+    size_t   ram_size;          /* Guest physical RAM size (default 256MB) */
+    uint64_t seed;              /* Master deterministic PRNG seed */
+    uint64_t start_time_ns;     /* Initial deterministic UNIX epoch (ns) */
+    uint64_t preempt_quantum;   /* Retired conditional branches per thread slice (default 20000) */
+    uint64_t max_syscalls;      /* Deterministic timeout budget (0 = unlimited) */
+    uint64_t max_preempts;      /* Deterministic preempt budget (0 = unlimited) */
+    bool     trace_syscalls;    /* Print syscall trace */
+    bool     capture_output;    /* Capture stdout/stderr into internal buffers instead of host tty */
+    bool     enable_pmu;        /* Enable hardware ExRetCond zero-skid preemption (default true) */
+    bool     patch_rdrand;      /* Scan & patch RDRAND/RDSEED in executable pages (default true) */
+    bool     allow_host_ro;     /* Allow read-only access to host files/shared libs (default true) */
+} dethv_config_t;
+
+typedef struct {
+    dethv_stop_reason_t reason;
+    int      exit_code;         /* Process exit status if EXITED */
+    int      signal;            /* Crash signal number if CRASH_* */
+    uint64_t fault_rip;         /* RIP at stop/crash */
+    uint64_t fault_addr;        /* CR2 faulting address (for SEGV) */
+    uint64_t fault_errcode;     /* Exception error code */
+    uint64_t syscalls;          /* Total syscalls executed */
+    uint64_t preempts;          /* Total deterministic thread preemptions */
+    uint64_t rdtsc_traps;       /* Total RDTSC/RDTSCP traps emulated */
+    uint64_t rdrand_traps;      /* Total RDRAND/RDSEED instructions emulated */
+    uint64_t getrandom_calls;   /* Total getrandom/urandom reads emulated */
+    uint64_t total_threads;     /* Total threads spawned */
+    uint64_t pmu_overshoots;    /* Should always be 0 */
+    uint64_t dirty_pages;       /* Dirty pages touched since snapshot restore */
+    uint64_t state_hash;        /* FNV-1a/SipHash digest of final regs + stdout + stderr */
+    uint64_t stdout_hash;       /* Hash of captured stdout */
+    size_t   stdout_len;
+    size_t   stderr_len;
+} dethv_run_result_t;
+
+/* Default configuration */
+void dethv_config_default(dethv_config_t *cfg);
+
+/* Create / destroy VM */
+dethv_vm_t *dethv_create(const dethv_config_t *cfg);
+void        dethv_destroy(dethv_vm_t *vm);
+
+/* Load unmodified Linux ELF binary (static or dynamic!) */
+int dethv_load_elf(dethv_vm_t *vm, const char *path, int argc, char **argv, char **envp);
+
+/* Resolve an ELF symbol address (returns 0 if not found) */
+uint64_t dethv_lookup_symbol(dethv_vm_t *vm, const char *sym_name);
+
+/* Configure snapshot trigger */
+int  dethv_set_snapshot_addr(dethv_vm_t *vm, uint64_t vaddr);
+void dethv_set_snapshot_on_stdin(dethv_vm_t *vm, bool enable);
+void dethv_set_snapshot_on_open(dethv_vm_t *vm, const char *path_substr);
+
+/* Input / Virtual file injection (useful after snapshot reload for fuzzing!) */
+int dethv_set_stdin(dethv_vm_t *vm, const void *data, size_t len);
+int dethv_set_vfile(dethv_vm_t *vm, const char *path, const void *data, size_t len);
+
+/* Read/write guest virtual memory */
+int dethv_read_virt(dethv_vm_t *vm, uint64_t vaddr, void *dst, size_t len);
+int dethv_write_virt(dethv_vm_t *vm, uint64_t vaddr, const void *src, size_t len);
+
+/* Access captured output */
+const uint8_t *dethv_get_stdout(const dethv_vm_t *vm, size_t *len_out);
+const uint8_t *dethv_get_stderr(const dethv_vm_t *vm, size_t *len_out);
+
+/* Run guest until exit, crash, timeout, or snapshot trigger */
+int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res);
+
+/* Snapshot management (ultra-fast in-memory + persistent disk save/load) */
+dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm);
+int               dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap);
+void              dethv_snapshot_free(dethv_snapshot_t *snap);
+int               dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path);
+dethv_snapshot_t *dethv_snapshot_load_file(const char *path);
+
+/* Lightweight one-shot coverage breakpoints for unmodified ELF fuzzing */
+int      dethv_cov_install_symbols(dethv_vm_t *vm, dethv_snapshot_t *snap);
+uint64_t dethv_cov_get_count(const dethv_vm_t *vm);
+
+/* Utility: string name for stop reason */
+const char *dethv_stop_reason_str(dethv_stop_reason_t reason);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DETHV_H */

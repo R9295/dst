@@ -1,7 +1,8 @@
 build/
 agave/
 farf/
-validator-harness/target/
+fandango-rs/
+validator-harness/
 *.dhvs
 *.o
 *.bin

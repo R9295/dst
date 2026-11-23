@@ -12,7 +12,9 @@
   - **Deterministic Memory, Networking, `io_uring`, & VFS**:
     - Fixed non-ASLR memory layout, split KVM memory slots around the 3–4 GiB x86 MMIO/LAPIC hole (supporting multi-GiB guests like Solana Agave with `--ram 4096`), physical page recycling on `munmap`, coherent `MAP_SHARED` file mappings.
     - Deterministic PID/TID (`1000+`), sanitized environment (`--env K=V`) & `uname`, deterministic `stat`/`statx` metadata, isolated in-memory VFS (directories, `getdents64`, `rename`/`unlink`/`truncate`, `/proc/*`, `/sys/*`, `/etc/hosts`, zero writes to host disk and zero host `/proc`/`/sys`/`/dev`/`/tmp` leakage), `CR4.UMIP = 1`.
-    - Deterministic virtual loopback networking (`src/net.c`: `AF_INET`/`AF_INET6` UDP & TCP, `AF_UNIX` `socketpair`, `sendmmsg`/`recvmmsg`, `epoll` including edge-triggered `EPOLLET`, `timerfd`) and synchronous deterministic `io_uring` (`src/iouring.c`).
+    - Deterministic virtual networking (`src/net.c`: `AF_INET`/`AF_INET6` UDP & TCP, `AF_UNIX` `socketpair`, `sendmmsg`/`recvmmsg`, `epoll` including edge-triggered `EPOLLET`, `timerfd`, plus host-side virtual peer UDP bridge `dethv_net_set_peer_ip` / `dethv_net_inject_udp` / `dethv_net_pop_tx` and bounded virtual-time stepping `dethv_run_step`) and synchronous deterministic `io_uring` (`src/iouring.c`).
+- **Embeddable C Static Library (`build/libdethv.a`)**:
+  - Link `build/libdethv.a` against any C/C++/Rust harness or fuzzer (`include/dethv.h`), with host directory VFS import (`dethv_import_host_dir`), guest output streaming callback (`dethv_set_output_cb`), and full network/`io_uring`/pipe `.dhvs` v3 snapshots.
 - **Ultra-Fast Snapshot Fuzzing (~46,000–49,000 exec/s on 1 vCPU)**:
   - Uses **x86_64 hardware guest `PTE_D` dirty-bit tracking** + a compact host-VMM dirty-page tracker (`host_dirty_gfns`) + a ~30 ns Ring-0 `CR3` TLB reload instead of expensive KVM NPT write-protect `#NPF` faults.
   - Restores CPU registers via zero-ioctl `KVM_SYNC_X86_REGS`.
@@ -57,27 +59,9 @@ make test
 ./build/dethv --ram 4096 --quantum 200000 --env RUST_LOG=info --verify 3 -- \
   ./agave/target/release/deps/local_cluster-* test_local_cluster_start_and_exit --exact --nocapture --test-threads=1
 
-# Run the deterministic Solana/Agave validator testing harness (60% stake mock leader, startup snapshot,
-# Turbine + Repair + Alpenglow BLS certs until 8 slots finalized, 3x snapshot-reload determinism check)
+# Build the embeddable DetHV static library (for external harnesses/fuzzers)
 make -j build/libdethv.a
-(cd validator-harness && cargo build --release)
-./validator-harness/target/release/validator-harness --verify 3
-
-# Reload the saved startup snapshot in a fresh OS process (skipping validator boot)
-./validator-harness/target/release/validator-harness --load-snap build/agave_startup.dhvs --verify 1
 ```
-
-## Deterministic Validator Testing System (`validator-harness/`)
-
-`validator-harness/` runs an **unmodified `agave-validator`** (Agave 5.0 with Alpenglow/Votor) inside DetHV against a deterministic host-side **Mock Validator** bridged over DetHV's virtual peer UDP interface (`10.0.0.1` <-> `10.0.0.2`):
-
-- **2-Validator Genesis (`60%` Mock / `40%` Test)**: Built via `solana-genesis` with fixed creation time and rent-adjusted active stakes (`600 SOL` / `400 SOL`) and identity-derived BLS keys, naturally assigning the Mock Validator as the Epoch-0 leader for all slots `0..=11`.
-- **Startup Snapshot**: Boots `agave-validator` inside DetHV until `--init-complete-file /tmp/init_complete`, snapshots full VM + socket/epoll/io_uring/VFS state (`build/agave_startup.dhvs`, format v3), and serves every test run from slot 0.
-- **Full Wire Protocol Coverage**:
-  - **Gossip**: Deterministic `ContactInfo` discovery (`outset` fixed) + `Ping`/`Pong` exchange.
-  - **Block Production & Turbine**: Builds real Alpenglow blocks (`BlockHeaderV1`, `BlockFooterV1` with frozen `bank_hash`, `Alpentick`, Merkle shreds, and Double Merkle Root `block_id`) and broadcasts via TVU UDP.
-  - **Active Repair**: Intentionally withholds data shred #1 on slots `2, 4, 6, 8` and serves `ServeRepair` requests (`WindowIndex`, `WindowIndexForBlockId`, `HighestWindowIndex`, `Orphan`, `ParentAndFecSetCount`, `FecSetRoot`).
-  - **Alpenglow Certificates**: Runs a deterministic sans-IO mTLS QUIC (`alpenglow-v1`, deterministic `rustls` X25519/RNG + `quinn-proto` CIDs/virtual time) endpoint sending valid 60%-stake BLS-signed `Notarize` and `Finalize` certificates until the test validator finalizes and roots 8 slots (`new root 1..8`).
 
 ## Architecture
 
@@ -101,4 +85,3 @@ make -j build/libdethv.a
 | `src/main.c` | CLI runner, determinism verifier, snapshot benchmark, built-in snapshot fuzzer |
 | `tests/nondet_torture.c` | Comprehensive multithreaded + RNG + clock + ASLR non-determinism torture test |
 | `tests/fuzz_target.c` | Unmodified Linux C binary with multi-stage crashes (`SIGFPE`, `SIGSEGV`, `SIGABRT`) |
-| `validator-harness/` | Deterministic Agave validator test harness + 60%-stake mock leader (Gossip, Turbine, Repair, sans-IO mTLS QUIC Alpenglow certs) |

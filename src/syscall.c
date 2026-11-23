@@ -1676,6 +1676,31 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             ret = 0;
             break;
 
+        case LINUX_SYS_capget: {
+            struct { uint32_t version; int32_t pid; } hdr = {0, 0};
+            if (a1 == 0 || mmu_copy_from_guest(vm, &hdr, a1, sizeof(hdr)) < 0) {
+                ret = -EFAULT;
+                break;
+            }
+            if (hdr.version != 0x20080522U && hdr.version != 0x20071026U && hdr.version != 0x19980330U) {
+                hdr.version = 0x20080522U;
+                if (mmu_copy_to_guest(vm, a1, &hdr, sizeof(hdr)) < 0) { ret = -EFAULT; break; }
+                ret = (a2 == 0) ? 0 : -EINVAL;
+                break;
+            }
+            if (a2 != 0) {
+                uint32_t data[6] = {0};
+                size_t dsz = (hdr.version == 0x19980330U) ? 12 : 24;
+                if (mmu_copy_to_guest(vm, a2, data, dsz) < 0) { ret = -EFAULT; break; }
+            }
+            ret = 0;
+            break;
+        }
+
+        case LINUX_SYS_capset:
+            ret = 0;
+            break;
+
         /* ==================== Signals & Exit ==================== */
         case LINUX_SYS_rt_sigaction: {
             int sig = (int)a1;

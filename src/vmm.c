@@ -49,6 +49,8 @@ const char *dethv_stop_reason_str(dethv_stop_reason_t reason) {
         case DETHV_STOP_CRASH_BUS:  return "CRASH_SIGBUS";
         case DETHV_STOP_CRASH_TRAP: return "CRASH_SIGTRAP";
         case DETHV_STOP_SNAPSHOT:   return "SNAPSHOT";
+        case DETHV_STOP_STEP:       return "STEP";
+        case DETHV_STOP_NET_TX:     return "NET_TX";
         case DETHV_STOP_TIMEOUT:    return "TIMEOUT";
         case DETHV_STOP_DEADLOCK:   return "DEADLOCK";
         case DETHV_STOP_ERROR:      return "ERROR";
@@ -547,6 +549,19 @@ const uint8_t *dethv_get_stderr(const dethv_vm_t *vm, size_t *len_out) {
     return vm->vfs.stderr_buf;
 }
 
+void dethv_set_output_cb(dethv_vm_t *vm, dethv_output_cb_t cb, void *ctx) {
+    vm->output_cb     = cb;
+    vm->output_cb_ctx = ctx;
+}
+
+uint64_t dethv_get_vmono_ns(const dethv_vm_t *vm) {
+    return vm->det.vmono_ns;
+}
+
+uint64_t dethv_get_vtime_ns(const dethv_vm_t *vm) {
+    return vm->det.vtime_ns;
+}
+
 /* Handle CPU exceptions reported by Ring-0 stub_isr_common */
 void dethv_handle_exception(dethv_vm_t *vm) {
     uint64_t vec = vm->shared->exc_vector;
@@ -669,7 +684,7 @@ static uint64_t compute_state_hash(const dethv_vm_t *vm) {
     return h;
 }
 
-int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
+static int run_vm_loop(dethv_vm_t *vm, dethv_run_result_t *res) {
     vm->running      = true;
     vm->stop_reason  = DETHV_STOP_NONE;
     vm->exit_code    = 0;
@@ -680,6 +695,10 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
     g_stop_requested = 0;
     signal(SIGTERM, handle_stop_sig);
     signal(SIGINT,  handle_stop_sig);
+
+    if (!sched_ensure_runnable(vm)) {
+        goto done_run;
+    }
 
     while (vm->running) {
         if (g_stop_requested) {
@@ -820,6 +839,11 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
                     vm->stop_reason = DETHV_STOP_ERROR;
                     vm->running = false;
                 }
+                if (vm->running && vm->step_until_vmono_ns != 0 &&
+                    vm->det.vmono_ns >= vm->step_until_vmono_ns) {
+                    vm->stop_reason = DETHV_STOP_STEP;
+                    vm->running = false;
+                }
                 break;
             }
 
@@ -853,6 +877,7 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
         }
     }
 
+done_run:
     if (res) {
         memset(res, 0, sizeof(*res));
         res->reason          = vm->stop_reason;
@@ -876,4 +901,19 @@ int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
     }
 
     return (vm->stop_reason == DETHV_STOP_ERROR) ? -1 : 0;
+}
+
+int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res) {
+    vm->step_until_vmono_ns = 0;
+    vm->stop_on_net_tx      = false;
+    return run_vm_loop(vm, res);
+}
+
+int dethv_run_step(dethv_vm_t *vm, uint64_t until_vmono_ns, bool stop_on_tx, dethv_run_result_t *res) {
+    vm->step_until_vmono_ns = until_vmono_ns;
+    vm->stop_on_net_tx      = stop_on_tx;
+    int rc = run_vm_loop(vm, res);
+    vm->step_until_vmono_ns = 0;
+    vm->stop_on_net_tx      = false;
+    return rc;
 }

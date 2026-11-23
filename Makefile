@@ -2,15 +2,16 @@ CC      := gcc
 CFLAGS  := -O3 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11 -Iinclude -D_GNU_SOURCE
 LDFLAGS := -pthread
 
-BUILD   := build
-SRCS    := src/vmm.c src/mmu.c src/x86_patch.c src/elf_loader.c \
-           src/determinism.c src/scheduler.c src/vfs.c src/net.c src/iouring.c \
-           src/syscall.c src/snapshot.c src/main.c
-OBJS    := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS)) $(BUILD)/guest_stub_embed.o
+BUILD    := build
+LIB_SRCS := src/vmm.c src/mmu.c src/x86_patch.c src/elf_loader.c \
+            src/determinism.c src/scheduler.c src/vfs.c src/net.c src/iouring.c \
+            src/syscall.c src/snapshot.c
+LIB_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(BUILD)/guest_stub_embed.o
+OBJS     := $(LIB_OBJS) $(BUILD)/main.o
 
 .PHONY: all clean test tests
 
-all: $(BUILD)/dethv tests
+all: $(BUILD)/libdethv.a $(BUILD)/dethv tests
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -35,6 +36,9 @@ $(BUILD)/guest_stub_embed.o: $(BUILD)/guest_stub_embed.c
 
 $(BUILD)/%.o: src/%.c include/dethv.h include/dethv_guest.h include/internal.h include/guest_shared.h include/syscalls.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/libdethv.a: $(LIB_OBJS)
+	ar rcs $@ $^
 
 $(BUILD)/dethv: $(OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)

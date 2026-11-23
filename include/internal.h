@@ -351,16 +351,26 @@ typedef struct {
     uint64_t interval_ns;
 } vtimer_t;
 
+#define DETHV_NET_TX_QUEUE_LEN 2048
+
 typedef struct {
-    vsock_t  *sockets;          /* Heap-allocated [DETHV_MAX_SOCKETS] */
-    vepoll_t *epolls;           /* Heap-allocated [DETHV_MAX_EPOLLS] */
-    vtimer_t *timers;           /* Heap-allocated [DETHV_MAX_TIMERS] */
-    uint16_t  next_ephemeral_port;
-    bool      dirty;
+    vsock_t         *sockets;          /* Heap-allocated [DETHV_MAX_SOCKETS] */
+    vepoll_t        *epolls;           /* Heap-allocated [DETHV_MAX_EPOLLS] */
+    vtimer_t        *timers;           /* Heap-allocated [DETHV_MAX_TIMERS] */
+    uint16_t         next_ephemeral_port;
+    bool             dirty;
+    /* External virtual peer bridge (host-side mock peers) */
+    uint32_t         guest_ip;         /* Host byte order (0 = 127.0.0.1) */
+    uint32_t         peer_ip;          /* Host byte order (0 = disabled) */
+    dethv_udp_pkt_t *tx_q;             /* Heap-allocated [DETHV_NET_TX_QUEUE_LEN] */
+    uint32_t         tx_head;
+    uint32_t         tx_count;
 } net_state_t;
 
 int      net_init(dethv_vm_t *vm);
 void     net_destroy(net_state_t *net);
+int      net_clone(net_state_t *dst, const net_state_t *src);
+int      net_restore(net_state_t *dst, const net_state_t *src);
 void     net_close_socket(dethv_vm_t *vm, uint32_t sidx);
 void     net_close_epoll(dethv_vm_t *vm, uint32_t eidx);
 void     net_close_timer(dethv_vm_t *vm, uint32_t tidx);
@@ -403,6 +413,9 @@ typedef struct {
 
 int      iouring_init(dethv_vm_t *vm);
 void     iouring_destroy(dethv_vm_t *vm);
+int      iouring_clone(viouring_t **dst_out, const viouring_t *src);
+int      iouring_restore(dethv_vm_t *vm, const viouring_t *src);
+void     iouring_free_array(viouring_t *arr);
 void     iouring_close(dethv_vm_t *vm, uint32_t idx);
 int      iouring_sys_setup(dethv_vm_t *vm, uint32_t entries, uint64_t params_guest);
 uint64_t iouring_mmap(dethv_vm_t *vm, int fd, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, int64_t off);
@@ -482,6 +495,7 @@ bool     sched_exit_current_thread(dethv_vm_t *vm, int exit_code);
 void     sched_prepare_pmu(dethv_vm_t *vm);
 void     sched_account_pmu(dethv_vm_t *vm);
 bool     sched_wake_expired_timers(dethv_vm_t *vm);
+bool     sched_ensure_runnable(dethv_vm_t *vm);
 
 /* ================= Main Hypervisor VM Struct ================= */
 
@@ -539,6 +553,7 @@ struct dethv_vm {
     vfs_state_t            vfs;
     net_state_t            net;
     viouring_t            *iourings;
+    bool                   iouring_dirty;
     patch_table_t          patches;
     sym_table_t            syms;
 
@@ -559,6 +574,12 @@ struct dethv_vm {
     bool                   hc_input_set;
     uint64_t               hc_input_vaddr;
     size_t                 hc_input_max_len;
+
+    /* Step execution & streaming output hooks */
+    uint64_t               step_until_vmono_ns;
+    bool                   stop_on_net_tx;
+    dethv_output_cb_t      output_cb;
+    void                  *output_cb_ctx;
 
     /* Run status */
     bool                   running;
@@ -599,6 +620,10 @@ struct dethv_snapshot {
     mmu_state_t            mmu;
     sched_state_t          sched;
     vfs_state_t            vfs;
+    net_state_t            net;
+    bool                   net_used;
+    viouring_t            *iourings;
+    bool                   iouring_used;
     patch_table_t          patches;
     sym_table_t            syms;
     uint64_t               current_fs_base;

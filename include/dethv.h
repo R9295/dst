@@ -22,6 +22,8 @@ typedef enum {
     DETHV_STOP_CRASH_BUS,       /* SIGBUS (#AC / #SS) */
     DETHV_STOP_CRASH_TRAP,      /* SIGTRAP (unhandled int3 / #DB) */
     DETHV_STOP_SNAPSHOT,        /* Hit configured snapshot trigger */
+    DETHV_STOP_STEP,            /* Reached virtual time step deadline (dethv_run_step) */
+    DETHV_STOP_NET_TX,          /* Guest transmitted UDP packet to external virtual peer */
     DETHV_STOP_TIMEOUT,         /* Exceeded deterministic syscall/branch budget */
     DETHV_STOP_DEADLOCK,        /* All threads blocked with no wakeups */
     DETHV_STOP_ERROR            /* Internal hypervisor error */
@@ -86,17 +88,48 @@ int  dethv_set_stdin(dethv_vm_t *vm, const void *data, size_t len);
 int  dethv_set_input(dethv_vm_t *vm, const void *data, size_t len);
 void dethv_get_input_info(const dethv_vm_t *vm, uint64_t *guest_buf_vaddr, size_t *guest_max_len);
 int  dethv_set_vfile(dethv_vm_t *vm, const char *path, const void *data, size_t len);
+int  dethv_set_vdir(dethv_vm_t *vm, const char *path);
+int  dethv_import_host_dir(dethv_vm_t *vm, const char *host_dir, const char *guest_dir);
 
 /* Read/write guest virtual memory */
 int dethv_read_virt(dethv_vm_t *vm, uint64_t vaddr, void *dst, size_t len);
 int dethv_write_virt(dethv_vm_t *vm, uint64_t vaddr, const void *src, size_t len);
 
-/* Access captured output */
+/* Access captured output & optional live streaming callback */
 const uint8_t *dethv_get_stdout(const dethv_vm_t *vm, size_t *len_out);
 const uint8_t *dethv_get_stderr(const dethv_vm_t *vm, size_t *len_out);
+typedef void (*dethv_output_cb_t)(void *ctx, int fd, const uint8_t *data, size_t len);
+void dethv_set_output_cb(dethv_vm_t *vm, dethv_output_cb_t cb, void *ctx);
+
+/* Deterministic virtual clocks (nanoseconds) */
+uint64_t dethv_get_vmono_ns(const dethv_vm_t *vm);
+uint64_t dethv_get_vtime_ns(const dethv_vm_t *vm);
+
+/* Deterministic Virtual Network Peer Bridge (for host-side mock peers/validators) */
+typedef struct {
+    uint32_t src_ip;            /* Host byte order (e.g., 0x0a000002 = 10.0.0.2) */
+    uint16_t src_port;          /* Host byte order */
+    uint32_t dst_ip;            /* Host byte order (e.g., 0x0a000001 = 10.0.0.1) */
+    uint16_t dst_port;          /* Host byte order */
+    uint64_t vmono_ns;          /* Guest deterministic monotonic timestamp when sent */
+    uint32_t len;
+    uint8_t  data[1600];
+} dethv_udp_pkt_t;
+
+void   dethv_net_set_peer_ip(dethv_vm_t *vm, uint32_t guest_ip_host_order, uint32_t peer_ip_host_order);
+int    dethv_net_inject_udp(dethv_vm_t *vm,
+                            uint32_t src_ip, uint16_t src_port,
+                            uint32_t dst_ip, uint16_t dst_port,
+                            const void *data, size_t len);
+int    dethv_net_pop_tx(dethv_vm_t *vm, dethv_udp_pkt_t *out);
+size_t dethv_net_get_bound_udp_ports(const dethv_vm_t *vm, uint16_t *ports_out, size_t max_ports);
 
 /* Run guest until exit, crash, timeout, or snapshot trigger */
 int dethv_run(dethv_vm_t *vm, dethv_run_result_t *res);
+
+/* Run guest deterministically until virtual monotonic clock reaches `until_vmono_ns`
+ * or an external peer TX packet is sent (when `stop_on_tx` is true). */
+int dethv_run_step(dethv_vm_t *vm, uint64_t until_vmono_ns, bool stop_on_tx, dethv_run_result_t *res);
 
 /* Snapshot management (ultra-fast in-memory + persistent disk save/load) */
 dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm);

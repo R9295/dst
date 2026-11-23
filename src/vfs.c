@@ -133,6 +133,59 @@ int dethv_set_vfile(dethv_vm_t *vm, const char *path, const void *data, size_t l
     return vfs_set_vfile_data(&vm->vfs, path, data, len);
 }
 
+int dethv_set_vdir(dethv_vm_t *vm, const char *path) {
+    char norm[512];
+    normalize_path(path, norm, sizeof(norm));
+    vm->vfs.vfiles_dirty = true;
+    /* Ensure intermediate parent directories exist */
+    char tmp[512];
+    size_t len = strlen(norm);
+    for (size_t i = 1; i < len; i++) {
+        if (norm[i] == '/') {
+            memcpy(tmp, norm, i);
+            tmp[i] = '\0';
+            alloc_vfile_slot(&vm->vfs, tmp, S_IFDIR | 0755, true);
+        }
+    }
+    return alloc_vfile_slot(&vm->vfs, norm, S_IFDIR | 0755, true) >= 0 ? 0 : -1;
+}
+
+int dethv_import_host_dir(dethv_vm_t *vm, const char *host_dir, const char *guest_dir) {
+    if (dethv_set_vdir(vm, guest_dir) < 0) return -1;
+    DIR *dp = opendir(host_dir);
+    if (!dp) return -1;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char hpath[1024], gpath[512];
+        snprintf(hpath, sizeof(hpath), "%s/%s", host_dir, de->d_name);
+        if (strcmp(guest_dir, "/") == 0)
+            snprintf(gpath, sizeof(gpath), "/%s", de->d_name);
+        else
+            snprintf(gpath, sizeof(gpath), "%s/%s", guest_dir, de->d_name);
+
+        struct stat st;
+        if (stat(hpath, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (dethv_import_host_dir(vm, hpath, gpath) < 0) { closedir(dp); return -1; }
+        } else if (S_ISREG(st.st_mode)) {
+            FILE *fp = fopen(hpath, "rb");
+            if (!fp) { closedir(dp); return -1; }
+            size_t sz = (size_t)st.st_size;
+            uint8_t *buf = sz > 0 ? malloc(sz) : NULL;
+            if (sz > 0 && (!buf || fread(buf, 1, sz, fp) != sz)) {
+                free(buf); fclose(fp); closedir(dp); return -1;
+            }
+            fclose(fp);
+            int rc = dethv_set_vfile(vm, gpath, buf, sz);
+            free(buf);
+            if (rc < 0) { closedir(dp); return -1; }
+        }
+    }
+    closedir(dp);
+    return 0;
+}
+
 int vfs_init(dethv_vm_t *vm) {
     vfs_state_t *vfs = &vm->vfs;
     memset(vfs, 0, sizeof(*vfs));
@@ -779,6 +832,9 @@ int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count) {
 
     switch (f->kind) {
         case FD_STDOUT: {
+            if (vm->output_cb) {
+                vm->output_cb(vm->output_cb_ctx, 1, (const uint8_t *)buf, count);
+            }
             if (!vm->cfg.capture_output) {
                 ssize_t w = write(STDOUT_FILENO, buf, count); (void)w;
             }
@@ -791,6 +847,9 @@ int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count) {
             return (int64_t)count;
         }
         case FD_STDERR: {
+            if (vm->output_cb) {
+                vm->output_cb(vm->output_cb_ctx, 2, (const uint8_t *)buf, count);
+            }
             if (!vm->cfg.capture_output) {
                 ssize_t w = write(STDERR_FILENO, buf, count); (void)w;
             }

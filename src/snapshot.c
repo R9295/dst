@@ -5,7 +5,7 @@
 #include <sys/ioctl.h>
 
 #define DETHV_SNAP_MAGIC   0x53564844U /* "DHVS" */
-#define DETHV_SNAP_VERSION 2U
+#define DETHV_SNAP_VERSION 3U
 
 static uint64_t g_next_snap_id = 1;
 
@@ -126,6 +126,35 @@ dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm) {
         return NULL;
     }
 
+    /* Check if networking or io_uring are in use and snapshot them cleanly */
+    snap->net_used = vm->net.dirty;
+    if (!snap->net_used && vm->net.sockets) {
+        for (int i = 0; i < DETHV_MAX_SOCKETS; i++)
+            if (vm->net.sockets[i].used) { snap->net_used = true; break; }
+        for (int i = 0; !snap->net_used && i < DETHV_MAX_EPOLLS; i++)
+            if (vm->net.epolls[i].used) { snap->net_used = true; break; }
+        for (int i = 0; !snap->net_used && i < DETHV_MAX_TIMERS; i++)
+            if (vm->net.timers[i].used) { snap->net_used = true; break; }
+    }
+    if (snap->net_used) {
+        if (net_clone(&snap->net, &vm->net) < 0) {
+            dethv_snapshot_free(snap);
+            return NULL;
+        }
+    }
+
+    snap->iouring_used = vm->iouring_dirty;
+    if (!snap->iouring_used && vm->iourings) {
+        for (int i = 0; i < DETHV_MAX_IOURINGS; i++)
+            if (vm->iourings[i].used) { snap->iouring_used = true; break; }
+    }
+    if (snap->iouring_used) {
+        if (iouring_clone(&snap->iourings, vm->iourings) < 0) {
+            dethv_snapshot_free(snap);
+            return NULL;
+        }
+    }
+
     if (build_wpte_table(snap, vm->mem) < 0) {
         dethv_snapshot_free(snap);
         return NULL;
@@ -141,6 +170,8 @@ dethv_snapshot_t *dethv_snapshot_take(dethv_vm_t *vm) {
     vm->vfs.pipes_dirty  = false;
     vm->vfs.vfiles_dirty = false;
     vm->vfs.cwd_dirty    = false;
+    vm->net.dirty        = false;
+    vm->iouring_dirty    = false;
     vm->sched.sigactions_dirty = false;
 
     return snap;
@@ -270,8 +301,12 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         }
         vm->patches.cov_hits = saved_cov > snap->patches.cov_hits ? saved_cov : snap->patches.cov_hits;
 
-        vm->current_fs_base     = snap->current_fs_base;
-        vm->fs_base_dirty       = false;
+        if (vm->current_fs_base != snap->current_fs_base) {
+            vm->current_fs_base = snap->current_fs_base;
+            vm->fs_base_dirty   = true;
+        } else {
+            vm->fs_base_dirty   = false;
+        }
         vm->sregs_dirty         = false;
         vm->snap_on_stdin_armed = false;
         vm->snap_on_open_armed  = false;
@@ -279,12 +314,23 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         vm->hc_input_pos        = 0;
 
         if (vfs_restore_fast(&vm->vfs, &snap->vfs) < 0) return -1;
+        if (vm->net.dirty || snap->net_used) {
+            if (net_restore(&vm->net, &snap->net) < 0) return -1;
+        } else {
+            vm->net.tx_head = 0;
+            vm->net.tx_count = 0;
+        }
+        if (vm->iouring_dirty || snap->iouring_used) {
+            if (iouring_restore(vm, snap->iourings) < 0) return -1;
+        }
     } else {
         memcpy(vm->mem, snap->mem, snap->phys_used);
         if (vm->mmu.next_phys > snap->phys_used) {
             memset(vm->mem + snap->phys_used, 0, vm->mmu.next_phys - snap->phys_used);
         }
-        vm->shared->flush_tlb = 1;
+        vm->shared->flush_tlb     = 1;
+        vm->shared->pmu_hw_on     = 1;
+        vm->shared->pmu_need_prog = 1;
         reset_host_dirty(vm);
         ioctl(vm->vcpu_fd, KVM_SET_XCRS, &snap->xcrs);
         ioctl(vm->vcpu_fd, KVM_SET_LAPIC, &snap->lapic);
@@ -318,6 +364,15 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
         vm->hc_input_pos        = 0;
 
         if (vfs_clone(&vm->vfs, &snap->vfs) < 0) return -1;
+        if (vm->net.dirty || snap->net_used) {
+            if (net_restore(&vm->net, &snap->net) < 0) return -1;
+        } else {
+            vm->net.tx_head = 0;
+            vm->net.tx_count = 0;
+        }
+        if (vm->iouring_dirty || snap->iouring_used) {
+            if (iouring_restore(vm, snap->iourings) < 0) return -1;
+        }
     }
 
     vm->last_dirty_pages = dirty_pages;
@@ -327,6 +382,8 @@ int dethv_snapshot_restore(dethv_vm_t *vm, const dethv_snapshot_t *snap) {
 void dethv_snapshot_free(dethv_snapshot_t *snap) {
     if (!snap) return;
     vfs_destroy(&snap->vfs);
+    net_destroy(&snap->net);
+    iouring_free_array(snap->iourings);
     x86_patch_destroy(&snap->patches);
     free(snap->wptes);
     free(snap->mem);
@@ -399,6 +456,62 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
                 write_all(fp, vf->data, vf->len)) {
                 fclose(fp);
                 return -1;
+            }
+        }
+    }
+
+    /* Serialize active pipes */
+    for (int i = 0; i < DETHV_MAX_PIPES; i++) {
+        uint8_t used = (snap->vfs.pipes && snap->vfs.pipes[i].used) ? 1 : 0;
+        if (write_all(fp, &used, 1)) { fclose(fp); return -1; }
+        if (used && write_all(fp, &snap->vfs.pipes[i], sizeof(vpipe_t))) { fclose(fp); return -1; }
+    }
+
+    /* Serialize networking state (sockets, epolls, timers) */
+    uint8_t has_net = snap->net_used ? 1 : 0;
+    if (write_all(fp, &has_net, 1)) { fclose(fp); return -1; }
+    if (has_net) {
+        if (write_all(fp, &snap->net.next_ephemeral_port, sizeof(snap->net.next_ephemeral_port))) {
+            fclose(fp); return -1;
+        }
+        for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
+            const vsock_t *s = &snap->net.sockets[i];
+            uint8_t used = s->used ? 1 : 0;
+            if (write_all(fp, &used, 1)) { fclose(fp); return -1; }
+            if (!used) continue;
+            if (write_all(fp, s, sizeof(vsock_t))) { fclose(fp); return -1; }
+            for (uint32_t k = 0; k < s->udp_count; k++) {
+                uint32_t idx = (s->udp_head + k) % DETHV_UDP_QUEUE_LEN;
+                if (write_all(fp, &s->udp_q[idx].len, sizeof(uint32_t)) ||
+                    write_all(fp, s->udp_q[idx].data, s->udp_q[idx].len)) {
+                    fclose(fp); return -1;
+                }
+            }
+            uint8_t has_sbuf = s->stream_buf ? 1 : 0;
+            if (write_all(fp, &has_sbuf, 1)) { fclose(fp); return -1; }
+            if (has_sbuf && write_all(fp, s->stream_buf, DETHV_STREAM_BUF_SIZE)) {
+                fclose(fp); return -1;
+            }
+        }
+        if (write_all(fp, snap->net.epolls, DETHV_MAX_EPOLLS * sizeof(vepoll_t)) ||
+            write_all(fp, snap->net.timers, DETHV_MAX_TIMERS * sizeof(vtimer_t))) {
+            fclose(fp); return -1;
+        }
+    }
+
+    /* Serialize io_uring state */
+    uint8_t has_ur = (snap->iouring_used && snap->iourings) ? 1 : 0;
+    if (write_all(fp, &has_ur, 1)) { fclose(fp); return -1; }
+    if (has_ur) {
+        for (int i = 0; i < DETHV_MAX_IOURINGS; i++) {
+            const viouring_t *ur = &snap->iourings[i];
+            uint8_t used = ur->used ? 1 : 0;
+            if (write_all(fp, &used, 1)) { fclose(fp); return -1; }
+            if (!used) continue;
+            if (write_all(fp, ur, sizeof(viouring_t)) ||
+                write_all(fp, ur->ring_phys, ur->ring_npages * sizeof(uint64_t)) ||
+                write_all(fp, ur->sqe_phys, ur->sqe_npages * sizeof(uint64_t))) {
+                fclose(fp); return -1;
             }
         }
     }
@@ -506,6 +619,92 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
                 vf->data = malloc(vf->len);
                 vf->cap = vf->len;
                 if (!vf->data || read_all(fp, vf->data, vf->len)) {
+                    fclose(fp); dethv_snapshot_free(snap); return NULL;
+                }
+            }
+        }
+    }
+
+    /* Deserialize active pipes */
+    for (int i = 0; i < DETHV_MAX_PIPES; i++) {
+        uint8_t used = 0;
+        if (read_all(fp, &used, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+        if (used && read_all(fp, &snap->vfs.pipes[i], sizeof(vpipe_t))) {
+            fclose(fp); dethv_snapshot_free(snap); return NULL;
+        }
+    }
+
+    /* Deserialize networking state */
+    uint8_t has_net = 0;
+    if (read_all(fp, &has_net, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+    snap->net_used = (has_net != 0);
+    if (snap->net_used) {
+        snap->net.sockets = calloc(DETHV_MAX_SOCKETS, sizeof(vsock_t));
+        snap->net.epolls  = calloc(DETHV_MAX_EPOLLS,  sizeof(vepoll_t));
+        snap->net.timers  = calloc(DETHV_MAX_TIMERS,  sizeof(vtimer_t));
+        if (!snap->net.sockets || !snap->net.epolls || !snap->net.timers ||
+            read_all(fp, &snap->net.next_ephemeral_port, sizeof(snap->net.next_ephemeral_port))) {
+            fclose(fp); dethv_snapshot_free(snap); return NULL;
+        }
+        for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
+            uint8_t used = 0;
+            if (read_all(fp, &used, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+            if (!used) continue;
+            vsock_t *s = &snap->net.sockets[i];
+            if (read_all(fp, s, sizeof(vsock_t))) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+            for (int q = 0; q < DETHV_UDP_QUEUE_LEN; q++) s->udp_q[q].data = NULL;
+            s->stream_buf = NULL;
+            for (uint32_t k = 0; k < s->udp_count; k++) {
+                uint32_t idx = (s->udp_head + k) % DETHV_UDP_QUEUE_LEN;
+                uint32_t plen = 0;
+                if (read_all(fp, &plen, sizeof(uint32_t))) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+                s->udp_q[idx].len = plen;
+                if (plen > 0) {
+                    s->udp_q[idx].data = malloc(plen);
+                    if (!s->udp_q[idx].data || read_all(fp, s->udp_q[idx].data, plen)) {
+                        fclose(fp); dethv_snapshot_free(snap); return NULL;
+                    }
+                }
+            }
+            uint8_t has_sbuf = 0;
+            if (read_all(fp, &has_sbuf, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+            if (has_sbuf) {
+                s->stream_buf = malloc(DETHV_STREAM_BUF_SIZE);
+                if (!s->stream_buf || read_all(fp, s->stream_buf, DETHV_STREAM_BUF_SIZE)) {
+                    fclose(fp); dethv_snapshot_free(snap); return NULL;
+                }
+            }
+        }
+        if (read_all(fp, snap->net.epolls, DETHV_MAX_EPOLLS * sizeof(vepoll_t)) ||
+            read_all(fp, snap->net.timers, DETHV_MAX_TIMERS * sizeof(vtimer_t))) {
+            fclose(fp); dethv_snapshot_free(snap); return NULL;
+        }
+    }
+
+    /* Deserialize io_uring state */
+    uint8_t has_ur = 0;
+    if (read_all(fp, &has_ur, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+    snap->iouring_used = (has_ur != 0);
+    if (snap->iouring_used) {
+        snap->iourings = calloc(DETHV_MAX_IOURINGS, sizeof(viouring_t));
+        if (!snap->iourings) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+        for (int i = 0; i < DETHV_MAX_IOURINGS; i++) {
+            uint8_t used = 0;
+            if (read_all(fp, &used, 1)) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+            if (!used) continue;
+            viouring_t *ur = &snap->iourings[i];
+            if (read_all(fp, ur, sizeof(viouring_t))) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+            ur->ring_phys = NULL;
+            ur->sqe_phys  = NULL;
+            if (ur->ring_npages > 0) {
+                ur->ring_phys = malloc(ur->ring_npages * sizeof(uint64_t));
+                if (!ur->ring_phys || read_all(fp, ur->ring_phys, ur->ring_npages * sizeof(uint64_t))) {
+                    fclose(fp); dethv_snapshot_free(snap); return NULL;
+                }
+            }
+            if (ur->sqe_npages > 0) {
+                ur->sqe_phys = malloc(ur->sqe_npages * sizeof(uint64_t));
+                if (!ur->sqe_phys || read_all(fp, ur->sqe_phys, ur->sqe_npages * sizeof(uint64_t))) {
                     fclose(fp); dethv_snapshot_free(snap); return NULL;
                 }
             }

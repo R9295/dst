@@ -75,14 +75,52 @@ int iouring_init(dethv_vm_t *vm) {
     return vm->iourings ? 0 : -1;
 }
 
-void iouring_destroy(dethv_vm_t *vm) {
-    if (!vm->iourings) return;
+void iouring_free_array(viouring_t *arr) {
+    if (!arr) return;
     for (int i = 0; i < DETHV_MAX_IOURINGS; i++) {
-        free(vm->iourings[i].ring_phys);
-        free(vm->iourings[i].sqe_phys);
+        free(arr[i].ring_phys);
+        free(arr[i].sqe_phys);
     }
-    free(vm->iourings);
+    free(arr);
+}
+
+void iouring_destroy(dethv_vm_t *vm) {
+    iouring_free_array(vm->iourings);
     vm->iourings = NULL;
+}
+
+int iouring_clone(viouring_t **dst_out, const viouring_t *src) {
+    if (!*dst_out) {
+        *dst_out = calloc(DETHV_MAX_IOURINGS, sizeof(viouring_t));
+        if (!*dst_out) return -1;
+    }
+    viouring_t *dst = *dst_out;
+    for (int i = 0; i < DETHV_MAX_IOURINGS; i++) {
+        free(dst[i].ring_phys); dst[i].ring_phys = NULL;
+        free(dst[i].sqe_phys);  dst[i].sqe_phys  = NULL;
+        dst[i].used = false;
+        if (!src || !src[i].used) continue;
+        dst[i] = src[i];
+        dst[i].ring_phys = NULL;
+        dst[i].sqe_phys  = NULL;
+        if (src[i].ring_npages > 0 && src[i].ring_phys) {
+            dst[i].ring_phys = malloc(src[i].ring_npages * sizeof(uint64_t));
+            if (!dst[i].ring_phys) return -1;
+            memcpy(dst[i].ring_phys, src[i].ring_phys, src[i].ring_npages * sizeof(uint64_t));
+        }
+        if (src[i].sqe_npages > 0 && src[i].sqe_phys) {
+            dst[i].sqe_phys = malloc(src[i].sqe_npages * sizeof(uint64_t));
+            if (!dst[i].sqe_phys) return -1;
+            memcpy(dst[i].sqe_phys, src[i].sqe_phys, src[i].sqe_npages * sizeof(uint64_t));
+        }
+    }
+    return 0;
+}
+
+int iouring_restore(dethv_vm_t *vm, const viouring_t *src) {
+    int rc = iouring_clone(&vm->iourings, src);
+    vm->iouring_dirty = false;
+    return rc;
 }
 
 void iouring_close(dethv_vm_t *vm, uint32_t idx) {
@@ -92,6 +130,7 @@ void iouring_close(dethv_vm_t *vm, uint32_t idx) {
     free(ur->ring_phys); ur->ring_phys = NULL;
     free(ur->sqe_phys);  ur->sqe_phys  = NULL;
     ur->used = false;
+    vm->iouring_dirty = true;
 }
 
 /* Ring header fixed offsets inside single-mmap ring region */
@@ -226,6 +265,7 @@ int iouring_sys_setup(dethv_vm_t *vm, uint32_t entries, uint64_t params_guest) {
     f->ref_idx = (uint32_t)idx;
     snprintf(f->path, sizeof(f->path), "anon_inode:[io_uring]");
     vm->vfs.fds_dirty = true;
+    vm->iouring_dirty = true;
     return fd;
 }
 

@@ -48,7 +48,7 @@
 
 /* PMU config */
 #define DETHV_PMI_VECTOR        0xFE
-#define DETHV_PMU_SLACK         224   /* Safe margin above observed AMD Zen PMI skid (~131) */
+#define DETHV_PMU_SLACK         1024  /* Safe margin above worst-case AMD Zen 4 tight-loop PMI skid */
 #define DETHV_VTSC_STEP_RDTSC   100
 #define DETHV_VTSC_STEP_SYSCALL 1000
 

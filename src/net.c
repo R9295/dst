@@ -30,7 +30,8 @@ int net_init(dethv_vm_t *vm) {
     n->sockets = calloc(DETHV_MAX_SOCKETS, sizeof(vsock_t));
     n->epolls  = calloc(DETHV_MAX_EPOLLS,  sizeof(vepoll_t));
     n->timers  = calloc(DETHV_MAX_TIMERS,  sizeof(vtimer_t));
-    if (!n->sockets || !n->epolls || !n->timers) return -1;
+    n->tx_q    = calloc(DETHV_NET_TX_QUEUE_LEN, sizeof(dethv_udp_pkt_t));
+    if (!n->sockets || !n->epolls || !n->timers || !n->tx_q) return -1;
     for (int i = 0; i < DETHV_MAX_SOCKETS; i++) n->sockets[i].peer_sock = -1;
     n->next_ephemeral_port = 40000;
     return 0;
@@ -59,6 +60,123 @@ void net_destroy(net_state_t *net) {
     }
     free(net->epolls); net->epolls = NULL;
     free(net->timers); net->timers = NULL;
+    free(net->tx_q);   net->tx_q   = NULL;
+}
+
+int net_clone(net_state_t *dst, const net_state_t *src) {
+    if (!dst->sockets) dst->sockets = calloc(DETHV_MAX_SOCKETS, sizeof(vsock_t));
+    if (!dst->epolls)  dst->epolls  = calloc(DETHV_MAX_EPOLLS,  sizeof(vepoll_t));
+    if (!dst->timers)  dst->timers  = calloc(DETHV_MAX_TIMERS,  sizeof(vtimer_t));
+    if (!dst->sockets || !dst->epolls || !dst->timers) return -1;
+
+    for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
+        if (dst->sockets[i].used) free_socket_buffers(&dst->sockets[i]);
+        dst->sockets[i].used = false;
+        if (!src->sockets || !src->sockets[i].used) continue;
+
+        vsock_t *d = &dst->sockets[i];
+        const vsock_t *s = &src->sockets[i];
+        *d = *s;
+        memset(d->udp_q, 0, sizeof(d->udp_q));
+        d->stream_buf = NULL;
+
+        for (uint32_t k = 0; k < s->udp_count; k++) {
+            uint32_t idx = (s->udp_head + k) % DETHV_UDP_QUEUE_LEN;
+            d->udp_q[idx] = s->udp_q[idx];
+            d->udp_q[idx].data = NULL;
+            if (s->udp_q[idx].len > 0 && s->udp_q[idx].data) {
+                d->udp_q[idx].data = malloc(s->udp_q[idx].len);
+                if (!d->udp_q[idx].data) return -1;
+                memcpy(d->udp_q[idx].data, s->udp_q[idx].data, s->udp_q[idx].len);
+            }
+        }
+        if (s->stream_buf) {
+            d->stream_buf = malloc(DETHV_STREAM_BUF_SIZE);
+            if (!d->stream_buf) return -1;
+            memcpy(d->stream_buf, s->stream_buf, DETHV_STREAM_BUF_SIZE);
+        }
+    }
+
+    if (src->epolls) memcpy(dst->epolls, src->epolls, DETHV_MAX_EPOLLS * sizeof(vepoll_t));
+    if (src->timers) memcpy(dst->timers, src->timers, DETHV_MAX_TIMERS * sizeof(vtimer_t));
+    dst->next_ephemeral_port = src->next_ephemeral_port;
+    dst->dirty = false;
+    dst->tx_head = 0;
+    dst->tx_count = 0;
+    return 0;
+}
+
+int net_restore(net_state_t *dst, const net_state_t *src) {
+    uint32_t saved_guest_ip = dst->guest_ip;
+    uint32_t saved_peer_ip  = dst->peer_ip;
+    int rc = net_clone(dst, src);
+    dst->guest_ip = saved_guest_ip;
+    dst->peer_ip  = saved_peer_ip;
+    return rc;
+}
+
+void dethv_net_set_peer_ip(dethv_vm_t *vm, uint32_t guest_ip_host_order, uint32_t peer_ip_host_order) {
+    vm->net.guest_ip = guest_ip_host_order;
+    vm->net.peer_ip  = peer_ip_host_order;
+}
+
+int dethv_net_inject_udp(dethv_vm_t *vm,
+                         uint32_t src_ip, uint16_t src_port,
+                         uint32_t dst_ip, uint16_t dst_port,
+                         const void *data, size_t len) {
+    vsock_t *dst = NULL;
+    for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
+        vsock_t *cand = &vm->net.sockets[i];
+        if (!cand->used || !cand->bound || cand->type != SOCK_DGRAM || cand->local_port != dst_port)
+            continue;
+        if (cand->local_ip == dst_ip) {
+            dst = cand;
+            break;
+        }
+        if (!dst) dst = cand;
+    }
+    if (!dst) return -1;
+    if (dst->udp_count >= DETHV_UDP_QUEUE_LEN) return -1;
+
+    uint32_t tail = (dst->udp_head + dst->udp_count) % DETHV_UDP_QUEUE_LEN;
+    udp_pkt_t *pkt = &dst->udp_q[tail];
+    pkt->src_ip   = src_ip;
+    pkt->src_port = src_port;
+    pkt->is_ipv6  = 0;
+    pkt->len      = (uint32_t)len;
+    pkt->data     = len > 0 ? malloc(len) : NULL;
+    if (len > 0) {
+        if (!pkt->data) return -1;
+        memcpy(pkt->data, data, len);
+    }
+    dst->udp_count++;
+    dst->io_gen++;
+    vm->net.dirty = true;
+    net_wake_io_waiters(vm);
+    return 0;
+}
+
+int dethv_net_pop_tx(dethv_vm_t *vm, dethv_udp_pkt_t *out) {
+    if (!vm->net.tx_q || vm->net.tx_count == 0) return 0;
+    if (out) *out = vm->net.tx_q[vm->net.tx_head];
+    vm->net.tx_head = (vm->net.tx_head + 1) % DETHV_NET_TX_QUEUE_LEN;
+    vm->net.tx_count--;
+    return 1;
+}
+
+size_t dethv_net_get_bound_udp_ports(const dethv_vm_t *vm, uint16_t *ports_out, size_t max_ports) {
+    size_t cnt = 0;
+    for (int i = 0; i < DETHV_MAX_SOCKETS && cnt < max_ports; i++) {
+        const vsock_t *s = &vm->net.sockets[i];
+        if (s->used && s->bound && s->type == SOCK_DGRAM) {
+            bool dup = false;
+            for (size_t k = 0; k < cnt; k++) {
+                if (ports_out[k] == s->local_port) { dup = true; break; }
+            }
+            if (!dup) ports_out[cnt++] = s->local_port;
+        }
+    }
+    return cnt;
 }
 
 static int alloc_socket_slot(dethv_vm_t *vm) {
@@ -197,11 +315,11 @@ void net_close_socket(dethv_vm_t *vm, uint32_t sidx) {
 }
 
 void net_close_epoll(dethv_vm_t *vm, uint32_t eidx) {
-    if (eidx < DETHV_MAX_EPOLLS) vm->net.epolls[eidx].used = false;
+    if (eidx < DETHV_MAX_EPOLLS) { vm->net.epolls[eidx].used = false; vm->net.dirty = true; }
 }
 
 void net_close_timer(dethv_vm_t *vm, uint32_t tidx) {
-    if (tidx < DETHV_MAX_TIMERS) vm->net.timers[tidx].used = false;
+    if (tidx < DETHV_MAX_TIMERS) { vm->net.timers[tidx].used = false; vm->net.dirty = true; }
 }
 
 uint64_t net_earliest_timer_ns(const dethv_vm_t *vm) {
@@ -372,8 +490,9 @@ int net_sys_bind(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) {
     }
 
     s->bound      = true;
-    s->local_ip   = (ip == 0) ? 0x7F000001U : ip;
+    s->local_ip   = (ip == 0) ? (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U) : ip;
     s->local_port = port;
+    vm->net.dirty = true;
     return 0;
 }
 
@@ -530,6 +649,9 @@ int net_sys_setsockopt(dethv_vm_t *vm, int fd, int level, int optname, const voi
         int v = 0; memcpy(&v, optval, 4); s->recv_pktinfo = (v != 0);
     } else if (level == IPPROTO_IPV6 && optname == IPV6_V6ONLY && optlen >= 4) {
         int v = 0; memcpy(&v, optval, 4); s->ipv6_only = (v != 0);
+    } else if (level == IPPROTO_UDP && (optname == 103 || optname == 104)) {
+        /* Disable UDP_SEGMENT (GSO) & UDP_GRO so quinn-udp uses clean single-datagram I/O */
+        return -ENOPROTOOPT;
     }
     return 0;
 }
@@ -597,8 +719,9 @@ int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int 
     /* UDP sendto */
     if (!s->bound) {
         s->bound = true;
-        s->local_ip = 0x7F000001U;
+        s->local_ip = vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U;
         s->local_port = alloc_ephemeral_port(vm, SOCK_DGRAM);
+        vm->net.dirty = true;
     }
 
     uint32_t dst_ip = s->peer_ip;
@@ -610,7 +733,30 @@ int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int 
     } else if (!s->connected) {
         return -EDESTADDRREQ;
     }
-    (void)dst_ip;
+
+    /* External virtual peer bridge: route UDP packets targeting peer_ip to host TX queue! */
+    if (vm->net.peer_ip != 0 && dst_ip == vm->net.peer_ip && vm->net.tx_q) {
+        if (vm->net.tx_count < DETHV_NET_TX_QUEUE_LEN) {
+            uint32_t tail = (vm->net.tx_head + vm->net.tx_count) % DETHV_NET_TX_QUEUE_LEN;
+            dethv_udp_pkt_t *tp = &vm->net.tx_q[tail];
+            uint32_t src_ip = s->local_ip ? s->local_ip : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
+            if (src_ip == 0x7F000001U && vm->net.guest_ip) src_ip = vm->net.guest_ip;
+            tp->src_ip   = src_ip;
+            tp->src_port = s->local_port;
+            tp->dst_ip   = dst_ip;
+            tp->dst_port = dst_port;
+            tp->vmono_ns = vm->det.vmono_ns;
+            size_t copy = len <= sizeof(tp->data) ? len : sizeof(tp->data);
+            tp->len = (uint32_t)copy;
+            if (copy > 0) memcpy(tp->data, buf, copy);
+            vm->net.tx_count++;
+        }
+        if (vm->stop_on_net_tx) {
+            vm->running = false;
+            vm->stop_reason = DETHV_STOP_NET_TX;
+        }
+        return (int64_t)len;
+    }
 
     /* Deliver deterministically to matching bound UDP socket(s) on dst_port */
     vsock_t *dst = NULL;
@@ -727,6 +873,7 @@ int net_sys_epoll_create(dethv_vm_t *vm, int flags) {
 
     memset(&vm->net.epolls[eidx], 0, sizeof(vepoll_t));
     vm->net.epolls[eidx].used = true;
+    vm->net.dirty = true;
 
     vfd_t *f = &vm->vfs.fds[fd];
     memset(f, 0, sizeof(*f));
@@ -852,6 +999,7 @@ int net_sys_timerfd_create(dethv_vm_t *vm, int clockid, int flags) {
     memset(&vm->net.timers[tidx], 0, sizeof(vtimer_t));
     vm->net.timers[tidx].used = true;
     vm->net.timers[tidx].clockid = clockid;
+    vm->net.dirty = true;
 
     vfd_t *f = &vm->vfs.fds[fd];
     memset(f, 0, sizeof(*f));

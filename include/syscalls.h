@@ -102,6 +102,8 @@
 #define LINUX_SYS_getpgrp               111
 #define LINUX_SYS_setsid                112
 #define LINUX_SYS_getgroups             115
+#define LINUX_SYS_capget                125
+#define LINUX_SYS_capset                126
 #define LINUX_SYS_sigaltstack           131
 #define LINUX_SYS_statfs                137
 #define LINUX_SYS_fstatfs               138

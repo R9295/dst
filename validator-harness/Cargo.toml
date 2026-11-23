@@ -1,0 +1,55 @@
+[workspace]
+
+[package]
+name = "validator-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Agave workspace crates (exact same commit & types as agave-validator!)
+agave-feature-set = { path = "../agave/feature-set", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+agave-shred-wire-format = { path = "../agave/shred/wire-format", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+agave-votor-messages = { path = "../agave/votor-messages", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+agave-votor-transport = { path = "../agave/votor-transport", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-core = { path = "../agave/core", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-entry = { path = "../agave/entry", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-gossip = { path = "../agave/gossip", version = "=5.0.0-alpha.1", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-leader-schedule = { path = "../agave/leader-schedule", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-ledger = { path = "../agave/ledger", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-runtime = { path = "../agave/runtime", version = "=5.0.0-alpha.1", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-tls-utils = { path = "../agave/tls-utils", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-version = { path = "../agave/version", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+
+# Exact versions matching agave/Cargo.toml
+bitvec = { version = "1.1.1", features = ["serde"] }
+bytes = "1.12.1"
+curve25519-dalek = "4.1.3"
+quinn-proto = { package = "anza-quinn-proto", version = "=0.11.19-vendor.1", features = ["rustls-ring"] }
+rand = "0.9.4"
+rand_chacha = "0.9.0"
+rustls = { version = "0.23.46", features = ["std", "ring"], default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+solana-bls-signatures = { version = "4.0.2", features = ["serde"] }
+solana-clock = "4.0.0"
+solana-epoch-schedule = "3.4.0"
+solana-genesis-config = "5.0.1"
+solana-hash = "4.7.0"
+solana-keypair = "4.0.1"
+solana-native-token = "3.0.0"
+solana-poh-config = "3.1.1"
+solana-pubkey = { version = "4.4.0", default-features = false }
+solana-rent = "4.5.0"
+solana-sha256-hasher = "3.1.0"
+solana-shred-version = "3.0.1"
+solana-signer = "4.0.0"
+solana-signer-store = "0.1.0"
+solana-stake-interface = "5.1.1"
+wincode = { version = "0.6.3", features = ["derive"] }
+
+[patch.crates-io]
+blstrs = { git = "https://github.com/anza-xyz/blstrs", rev = "a1faffa3420bdaf4102425c43f00cdd815d4f145" }
+crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "5ee1c6ec671d94db14ed9238eb99e59a84555aad" }
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }

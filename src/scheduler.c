@@ -171,6 +171,20 @@ bool sched_switch_next(dethv_vm_t *vm, bool current_yielded) {
                 earliest = t->wake_time_ns;
             }
         }
+        /* If stepping with a virtual time deadline, never fast-forward past it!
+         * Also yields cleanly instead of deadlocking when all threads await external peer packets. */
+        if (vm->step_until_vmono_ns != 0 &&
+            (earliest == UINT64_MAX || earliest > vm->step_until_vmono_ns)) {
+            if (vm->step_until_vmono_ns > vm->det.vmono_ns) {
+                uint64_t delta = vm->step_until_vmono_ns - vm->det.vmono_ns;
+                det_advance_time(&vm->det, delta);
+                vm->shared->vtsc += (delta * 25) / 10;
+            }
+            sched_wake_expired_timers(vm);
+            vm->running = false;
+            vm->stop_reason = DETHV_STOP_STEP;
+            return false;
+        }
         if (earliest != UINT64_MAX) {
             if (earliest > vm->det.vmono_ns) {
                 uint64_t delta = earliest - vm->det.vmono_ns;
@@ -201,6 +215,77 @@ bool sched_switch_next(dethv_vm_t *vm, bool current_yielded) {
         vm->shared->regs.rax = (uint64_t)sc->threads[next_idx].pending_ret;
         sc->threads[next_idx].has_pending_ret = false;
     }
+    return true;
+}
+
+/* Ensure current_idx points to a RUNNABLE thread before entering KVM_RUN
+ * (handles resuming cleanly after DETHV_STOP_STEP when all threads had blocked). */
+bool sched_ensure_runnable(dethv_vm_t *vm) {
+    sched_state_t *sc = &vm->sched;
+    if (sc->threads[sc->current_idx].state == THREAD_RUNNABLE) return true;
+
+    sched_wake_expired_timers(vm);
+    uint32_t slots = sc->used_slots ? sc->used_slots : 1;
+    int old_idx = sc->current_idx;
+    int next_idx = -1;
+    for (uint32_t step = 0; step < slots; step++) {
+        int idx = (int)(((uint32_t)old_idx + step) % slots);
+        if (sc->threads[idx].state == THREAD_RUNNABLE) {
+            next_idx = idx;
+            break;
+        }
+    }
+
+    if (next_idx < 0) {
+        uint64_t earliest = net_earliest_timer_ns(vm);
+        for (uint32_t i = 0; i < slots; i++) {
+            guest_thread_t *t = &sc->threads[i];
+            if ((t->state == THREAD_BLOCKED_SLEEP ||
+                 t->state == THREAD_BLOCKED_FUTEX ||
+                 t->state == THREAD_BLOCKED_IO) &&
+                t->has_timeout && t->wake_time_ns < earliest) {
+                earliest = t->wake_time_ns;
+            }
+        }
+        if (vm->step_until_vmono_ns != 0 &&
+            (earliest == UINT64_MAX || earliest > vm->step_until_vmono_ns)) {
+            if (vm->step_until_vmono_ns > vm->det.vmono_ns) {
+                uint64_t delta = vm->step_until_vmono_ns - vm->det.vmono_ns;
+                det_advance_time(&vm->det, delta);
+                vm->shared->vtsc += (delta * 25) / 10;
+            }
+            sched_wake_expired_timers(vm);
+            vm->running = false;
+            vm->stop_reason = DETHV_STOP_STEP;
+            return false;
+        }
+        if (earliest != UINT64_MAX) {
+            if (earliest > vm->det.vmono_ns) {
+                uint64_t delta = earliest - vm->det.vmono_ns;
+                det_advance_time(&vm->det, delta);
+                vm->shared->vtsc += (delta * 25) / 10;
+            }
+            sched_wake_expired_timers(vm);
+            for (uint32_t step = 0; step < slots; step++) {
+                int idx = (int)(((uint32_t)old_idx + step) % slots);
+                if (sc->threads[idx].state == THREAD_RUNNABLE) {
+                    next_idx = idx;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (next_idx < 0) {
+        vm->running = false;
+        vm->stop_reason = (sched_num_alive(sc) == 0) ? DETHV_STOP_EXITED : DETHV_STOP_DEADLOCK;
+        return false;
+    }
+
+    sc->current_idx = next_idx;
+    vm->shared->pmu_in_landing = 0;
+    vm->shared->pmu_need_prog  = 1;
+    sched_load_current(vm);
     return true;
 }
 

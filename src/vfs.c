@@ -67,14 +67,279 @@ static void normalize_path(const char *in, char *out, size_t out_sz) {
     out[pos] = '\0';
 }
 
+vfd_t *vfs_get_fd(vfs_state_t *vfs, int fd) {
+    if (fd < 0) return NULL;
+    if (fd < DETHV_MAX_FDS) {
+        return vfs->fds[fd].used ? &vfs->fds[fd] : NULL;
+    }
+    if (vfs->high_fds) {
+        for (uint32_t i = 0; i < vfs->max_high_fd_used; i++) {
+            if (vfs->high_fds[i].vfd.used && vfs->high_fds[i].fd_num == fd)
+                return &vfs->high_fds[i].vfd;
+        }
+    }
+    return NULL;
+}
+
+const vfd_t *vfs_get_fd_const(const vfs_state_t *vfs, int fd) {
+    return vfs_get_fd((vfs_state_t *)vfs, fd);
+}
+
+vfd_t *vfs_alloc_exact_fd(vfs_state_t *vfs, int fd) {
+    if (fd < 0 || fd > DETHV_MAX_FD_NUM) return NULL;
+    if (fd < DETHV_MAX_FDS) {
+        if ((uint32_t)(fd + 1) > vfs->max_fd_used) vfs->max_fd_used = (uint32_t)(fd + 1);
+        return &vfs->fds[fd];
+    }
+    if (!vfs->high_fds) {
+        vfs->high_fds = calloc(DETHV_MAX_HIGH_FDS, sizeof(high_vfd_t));
+        if (!vfs->high_fds) return NULL;
+        for (int i = 0; i < DETHV_MAX_HIGH_FDS; i++) vfs->high_fds[i].vfd.host_fd = -1;
+    }
+    for (uint32_t i = 0; i < vfs->max_high_fd_used; i++) {
+        if (vfs->high_fds[i].vfd.used && vfs->high_fds[i].fd_num == fd)
+            return &vfs->high_fds[i].vfd;
+    }
+    for (uint32_t i = 0; i < DETHV_MAX_HIGH_FDS; i++) {
+        if (!vfs->high_fds[i].vfd.used) {
+            vfs->high_fds[i].fd_num = fd;
+            if (i + 1 > vfs->max_high_fd_used) vfs->max_high_fd_used = i + 1;
+            return &vfs->high_fds[i].vfd;
+        }
+    }
+    return NULL;
+}
+
+/* ==================== Sparse 4KB-Page Backing for Large vfiles ==================== */
+
+static bool buf_is_all_zero(const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t i = 0;
+    while (i + 8 <= len) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        if (w != 0) return false;
+        i += 8;
+    }
+    while (i < len) {
+        if (p[i++] != 0) return false;
+    }
+    return true;
+}
+
+void vfile_free_sparse(vfile_t *vf) {
+    if (vf->l1_pages) {
+        for (uint32_t l1 = 0; l1 < VFILE_L1_SLOTS; l1++) {
+            if (!vf->l1_pages[l1]) continue;
+            for (uint32_t l2 = 0; l2 < VFILE_L2_SLOTS; l2++) {
+                free(vf->l1_pages[l1][l2]);
+            }
+            free(vf->l1_pages[l1]);
+        }
+        free(vf->l1_pages);
+        vf->l1_pages = NULL;
+    }
+    vf->sparse = false;
+}
+
+static int vfile_make_sparse(vfile_t *vf) {
+    if (vf->sparse) return 0;
+    uint8_t *old_data = vf->data;
+    size_t old_len = vf->len;
+    vf->data = NULL;
+    vf->cap = 0;
+    vf->sparse = true;
+    vf->l1_pages = NULL;
+    if (old_data && old_len > 0) {
+        for (size_t off = 0; off < old_len; off += PAGE_SIZE) {
+            size_t chunk = (off + PAGE_SIZE <= old_len) ? PAGE_SIZE : (old_len - off);
+            if (vfile_write_page(vf, off, old_data + off, chunk) < 0) {
+                free(old_data);
+                return -1;
+            }
+        }
+    }
+    free(old_data);
+    return 0;
+}
+
+int vfile_clone_sparse(vfile_t *dst, const vfile_t *src) {
+    vfile_free_sparse(dst);
+    free(dst->data);
+    dst->data = NULL;
+    dst->cap = 0;
+    dst->sparse = true;
+    if (!src->l1_pages) return 0;
+    dst->l1_pages = calloc(VFILE_L1_SLOTS, sizeof(uint8_t **));
+    if (!dst->l1_pages) return -1;
+    for (uint32_t l1 = 0; l1 < VFILE_L1_SLOTS; l1++) {
+        if (!src->l1_pages[l1]) continue;
+        dst->l1_pages[l1] = calloc(VFILE_L2_SLOTS, sizeof(uint8_t *));
+        if (!dst->l1_pages[l1]) return -1;
+        for (uint32_t l2 = 0; l2 < VFILE_L2_SLOTS; l2++) {
+            if (!src->l1_pages[l1][l2]) continue;
+            dst->l1_pages[l1][l2] = malloc(PAGE_SIZE);
+            if (!dst->l1_pages[l1][l2]) return -1;
+            memcpy(dst->l1_pages[l1][l2], src->l1_pages[l1][l2], PAGE_SIZE);
+        }
+    }
+    return 0;
+}
+
+bool vfile_read_page(const vfile_t *vf, uint64_t page_off, void *dst_4k) {
+    if (page_off >= vf->len) return false;
+    size_t avail = (vf->len - page_off < PAGE_SIZE) ? (size_t)(vf->len - page_off) : PAGE_SIZE;
+    if (!vf->sparse) {
+        if (!vf->data) return false;
+        memcpy(dst_4k, vf->data + page_off, avail);
+        return true;
+    }
+    uint64_t pidx = page_off >> 12;
+    uint32_t l1 = (uint32_t)(pidx / VFILE_L2_SLOTS);
+    uint32_t l2 = (uint32_t)(pidx % VFILE_L2_SLOTS);
+    if (l1 >= VFILE_L1_SLOTS || !vf->l1_pages || !vf->l1_pages[l1] || !vf->l1_pages[l1][l2])
+        return false;
+    memcpy(dst_4k, vf->l1_pages[l1][l2], avail);
+    return true;
+}
+
+int vfile_write_page(vfile_t *vf, uint64_t page_off, const void *src_4k, size_t valid_bytes) {
+    if (valid_bytes == 0) return 0;
+    if (valid_bytes > PAGE_SIZE) valid_bytes = PAGE_SIZE;
+    if (!vf->sparse) {
+        if (page_off + valid_bytes > VFILE_SPARSE_THRESHOLD) {
+            if (vfile_make_sparse(vf) < 0) return -1;
+        } else {
+            size_t end = (size_t)page_off + valid_bytes;
+            if (end > vf->cap) {
+                size_t ncap = vf->cap ? vf->cap * 2 : 4096;
+                while (ncap < end) ncap *= 2;
+                uint8_t *nb = realloc(vf->data, ncap);
+                if (!nb) return -1;
+                memset(nb + vf->cap, 0, ncap - vf->cap);
+                vf->data = nb;
+                vf->cap = ncap;
+            }
+            memcpy(vf->data + page_off, src_4k, valid_bytes);
+            return 0;
+        }
+    }
+    uint64_t pidx = page_off >> 12;
+    uint32_t l1 = (uint32_t)(pidx / VFILE_L2_SLOTS);
+    uint32_t l2 = (uint32_t)(pidx % VFILE_L2_SLOTS);
+    if (l1 >= VFILE_L1_SLOTS) return -1;
+    if (buf_is_all_zero(src_4k, valid_bytes)) {
+        if (vf->l1_pages && vf->l1_pages[l1] && vf->l1_pages[l1][l2]) {
+            if (valid_bytes == PAGE_SIZE) {
+                free(vf->l1_pages[l1][l2]);
+                vf->l1_pages[l1][l2] = NULL;
+            } else {
+                memset(vf->l1_pages[l1][l2], 0, valid_bytes);
+            }
+        }
+        return 0;
+    }
+    if (!vf->l1_pages) {
+        vf->l1_pages = calloc(VFILE_L1_SLOTS, sizeof(uint8_t **));
+        if (!vf->l1_pages) return -1;
+    }
+    if (!vf->l1_pages[l1]) {
+        vf->l1_pages[l1] = calloc(VFILE_L2_SLOTS, sizeof(uint8_t *));
+        if (!vf->l1_pages[l1]) return -1;
+    }
+    if (!vf->l1_pages[l1][l2]) {
+        vf->l1_pages[l1][l2] = calloc(1, PAGE_SIZE);
+        if (!vf->l1_pages[l1][l2]) return -1;
+    }
+    memcpy(vf->l1_pages[l1][l2], src_4k, valid_bytes);
+    return 0;
+}
+
+static void vfile_read_range(const vfile_t *vf, uint64_t off, void *dst, size_t n) {
+    if (!vf->sparse) {
+        if (vf->data && n > 0) memcpy(dst, vf->data + off, n);
+        else if (n > 0) memset(dst, 0, n);
+        return;
+    }
+    uint8_t *out = (uint8_t *)dst;
+    while (n > 0) {
+        uint64_t pidx = off >> 12;
+        size_t poff = (size_t)(off & (PAGE_SIZE - 1));
+        size_t chunk = PAGE_SIZE - poff;
+        if (chunk > n) chunk = n;
+        uint32_t l1 = (uint32_t)(pidx / VFILE_L2_SLOTS);
+        uint32_t l2 = (uint32_t)(pidx % VFILE_L2_SLOTS);
+        if (l1 < VFILE_L1_SLOTS && vf->l1_pages && vf->l1_pages[l1] && vf->l1_pages[l1][l2]) {
+            memcpy(out, vf->l1_pages[l1][l2] + poff, chunk);
+        } else {
+            memset(out, 0, chunk);
+        }
+        off += chunk;
+        out += chunk;
+        n -= chunk;
+    }
+}
+
+static int vfile_write_sparse_range(vfile_t *vf, uint64_t off, const void *src, size_t n) {
+    const uint8_t *in = (const uint8_t *)src;
+    while (n > 0) {
+        uint64_t pidx = off >> 12;
+        size_t poff = (size_t)(off & (PAGE_SIZE - 1));
+        size_t chunk = PAGE_SIZE - poff;
+        if (chunk > n) chunk = n;
+        uint32_t l1 = (uint32_t)(pidx / VFILE_L2_SLOTS);
+        uint32_t l2 = (uint32_t)(pidx % VFILE_L2_SLOTS);
+        if (l1 >= VFILE_L1_SLOTS) return -EFBIG;
+        if (buf_is_all_zero(in, chunk)) {
+            if (vf->l1_pages && vf->l1_pages[l1] && vf->l1_pages[l1][l2]) {
+                memset(vf->l1_pages[l1][l2] + poff, 0, chunk);
+            }
+        } else {
+            if (!vf->l1_pages) {
+                vf->l1_pages = calloc(VFILE_L1_SLOTS, sizeof(uint8_t **));
+                if (!vf->l1_pages) return -ENOSPC;
+            }
+            if (!vf->l1_pages[l1]) {
+                vf->l1_pages[l1] = calloc(VFILE_L2_SLOTS, sizeof(uint8_t *));
+                if (!vf->l1_pages[l1]) return -ENOSPC;
+            }
+            if (!vf->l1_pages[l1][l2]) {
+                vf->l1_pages[l1][l2] = calloc(1, PAGE_SIZE);
+                if (!vf->l1_pages[l1][l2]) return -ENOSPC;
+            }
+            memcpy(vf->l1_pages[l1][l2] + poff, in, chunk);
+        }
+        off += chunk;
+        in += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static bool vfile_has_open_fds(const vfs_state_t *vfs, uint32_t vf_idx) {
+    for (uint32_t i = 0; i < vfs->max_fd_used && i < DETHV_MAX_FDS; i++) {
+        if (vfs->fds[i].used && vfs->fds[i].kind == FD_MEM_VFILE && vfs->fds[i].ref_idx == vf_idx)
+            return true;
+    }
+    if (vfs->high_fds) {
+        for (uint32_t i = 0; i < vfs->max_high_fd_used; i++) {
+            if (vfs->high_fds[i].vfd.used && vfs->high_fds[i].vfd.kind == FD_MEM_VFILE &&
+                vfs->high_fds[i].vfd.ref_idx == vf_idx)
+                return true;
+        }
+    }
+    return false;
+}
+
 void vfs_resolve_path(const vfs_state_t *vfs, int dirfd, const char *path, char *out, size_t out_sz) {
     char raw[1024];
     if (path[0] == '/') {
         snprintf(raw, sizeof(raw), "%s", path);
     } else {
         const char *base = vfs->cwd;
-        if (dirfd != AT_FDCWD && dirfd >= 0 && dirfd < DETHV_MAX_FDS && vfs->fds[dirfd].used) {
-            base = vfs->fds[dirfd].path;
+        if (dirfd != AT_FDCWD) {
+            const vfd_t *df = vfs_get_fd_const(vfs, dirfd);
+            if (df) base = df->path;
         }
         if (strcmp(base, "/") == 0) {
             snprintf(raw, sizeof(raw), "/%s", path);
@@ -86,8 +351,9 @@ void vfs_resolve_path(const vfs_state_t *vfs, int dirfd, const char *path, char 
 }
 
 static int find_vfile_idx(const vfs_state_t *vfs, const char *path) {
+    if (!path || !path[0]) return -1;
     for (uint32_t i = 0; i < vfs->max_vfile_used; i++) {
-        if (vfs->vfiles[i].used && strcmp(vfs->vfiles[i].path, path) == 0)
+        if (vfs->vfiles[i].used && vfs->vfiles[i].path[0] && strcmp(vfs->vfiles[i].path, path) == 0)
             return (int)i;
     }
     return -1;
@@ -99,6 +365,7 @@ static int alloc_vfile_slot(vfs_state_t *vfs, const char *path, uint32_t mode, b
     for (uint32_t i = 0; i < DETHV_MAX_VFILES; i++) {
         if (!vfs->vfiles[i].used) {
             vfile_t *vf = &vfs->vfiles[i];
+            vfile_free_sparse(vf);
             vf->used   = true;
             vf->is_dir = is_dir;
             snprintf(vf->path, sizeof(vf->path), "%.*s", (int)(sizeof(vf->path) - 1), path);
@@ -117,6 +384,13 @@ int vfs_set_vfile_data(vfs_state_t *vfs, const char *path, const void *data, siz
     int idx = alloc_vfile_slot(vfs, norm, S_IFREG | 0644, false);
     if (idx < 0) return -1;
     vfile_t *vf = &vfs->vfiles[idx];
+    vfile_free_sparse(vf);
+    if (len > VFILE_SPARSE_THRESHOLD) {
+        vf->len = len;
+        if (vfile_make_sparse(vf) < 0) return -1;
+        if (len > 0 && data && vfile_write_sparse_range(vf, 0, data, len) < 0) return -1;
+        return 0;
+    }
     if (len > vf->cap) {
         uint8_t *nb = realloc(vf->data, len);
         if (!nb) return -1;
@@ -191,11 +465,13 @@ int vfs_init(dethv_vm_t *vm) {
     memset(vfs, 0, sizeof(*vfs));
     for (int i = 0; i < DETHV_MAX_FDS; i++) vfs->fds[i].host_fd = -1;
 
-    vfs->pipes      = calloc(DETHV_MAX_PIPES,  sizeof(vpipe_t));
-    vfs->vfiles     = calloc(DETHV_MAX_VFILES, sizeof(vfile_t));
+    vfs->high_fds   = calloc(DETHV_MAX_HIGH_FDS, sizeof(high_vfd_t));
+    vfs->pipes      = calloc(DETHV_MAX_PIPES,    sizeof(vpipe_t));
+    vfs->vfiles     = calloc(DETHV_MAX_VFILES,   sizeof(vfile_t));
     vfs->stdout_buf = calloc(1, DETHV_OUT_CAP);
     vfs->stderr_buf = calloc(1, DETHV_OUT_CAP);
-    if (!vfs->pipes || !vfs->vfiles || !vfs->stdout_buf || !vfs->stderr_buf) return -1;
+    if (!vfs->high_fds || !vfs->pipes || !vfs->vfiles || !vfs->stdout_buf || !vfs->stderr_buf) return -1;
+    for (int i = 0; i < DETHV_MAX_HIGH_FDS; i++) vfs->high_fds[i].vfd.host_fd = -1;
 
     vfs->fds[0] = (vfd_t){ .used = true, .kind = FD_STDIN,  .flags = O_RDONLY, .host_fd = -1, .path = "/dev/stdin" };
     vfs->fds[1] = (vfd_t){ .used = true, .kind = FD_STDOUT, .flags = O_WRONLY, .host_fd = -1, .path = "/dev/stdout" };
@@ -208,21 +484,39 @@ int vfs_init(dethv_vm_t *vm) {
 
     /* Pre-populate deterministic virtual directories & system files */
     static const char *init_dirs[] = {
-        "/", "/tmp", "/var", "/var/tmp", "/etc", "/dev", "/dev/shm", "/proc", "/sys", "/root", "/run"
+        "/", "/tmp", "/var", "/var/tmp", "/etc", "/dev", "/dev/shm", "/proc", "/sys", "/root", "/run",
+        "/mnt", "/mnt/.fd", "/mnt/.fd/.huge", "/mnt/.fd/.gigantic",
+        "/sys/devices", "/sys/devices/system", "/sys/devices/system/node",
+        "/sys/devices/system/node/node0",
+        "/sys/devices/system/cpu", "/sys/devices/system/cpu/cpu0",
+        "/sys/devices/system/cpu/cpu0/node0",
+        "/sys/devices/system/cpu/cpu0/topology",
+        "/sys/devices/system/cpu/cpu0/cache",
+        "/sys/devices/system/cpu/cpu0/cache/index0"
     };
     for (size_t i = 0; i < sizeof(init_dirs) / sizeof(init_dirs[0]); i++) {
-        alloc_vfile_slot(vfs, init_dirs[i], S_IFDIR | 0755, true);
+        uint32_t dmode = (strncmp(init_dirs[i], "/mnt/.fd", 8) == 0) ? (S_IFDIR | 0700) : (S_IFDIR | 0755);
+        alloc_vfile_slot(vfs, init_dirs[i], dmode, true);
     }
     const char *hosts = "127.0.0.1 localhost\n::1 localhost\n";
     vfs_set_vfile_data(vfs, "/etc/hosts", hosts, strlen(hosts));
-    const char *nsswitch = "hosts: files\n";
+    const char *nsswitch = "passwd: files\ngroup: files\nhosts: files\n";
     vfs_set_vfile_data(vfs, "/etc/nsswitch.conf", nsswitch, strlen(nsswitch));
+    const char *passwd = "root:x:0:0:root:/root:/bin/sh\ndethv:x:1000:1000:DetHV:/root:/bin/sh\n";
+    vfs_set_vfile_data(vfs, "/etc/passwd", passwd, strlen(passwd));
+    const char *group = "root:x:0:\ndethv:x:1000:\n";
+    vfs_set_vfile_data(vfs, "/etc/group", group, strlen(group));
     const char *resolv = "nameserver 127.0.0.1\n";
     vfs_set_vfile_data(vfs, "/etc/resolv.conf", resolv, strlen(resolv));
     const char *hostname = "dethv\n";
     vfs_set_vfile_data(vfs, "/etc/hostname", hostname, strlen(hostname));
     const char *mid = "dethv000000000000000000000000000\n";
     vfs_set_vfile_data(vfs, "/etc/machine-id", mid, strlen(mid));
+    vfs_set_vfile_data(vfs, "/sys/devices/system/cpu/cpu0/topology/physical_package_id", "0\n", 2);
+    vfs_set_vfile_data(vfs, "/sys/devices/system/cpu/cpu0/topology/core_id", "0\n", 2);
+    vfs_set_vfile_data(vfs, "/sys/devices/system/cpu/cpu0/topology/die_id", "0\n", 2);
+    vfs_set_vfile_data(vfs, "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "0\n", 2);
+    vfs_set_vfile_data(vfs, "/sys/devices/system/cpu/cpu0/online", "1\n", 2);
 
     return 0;
 }
@@ -234,8 +528,19 @@ void vfs_destroy(vfs_state_t *vfs) {
             vfs->fds[i].host_fd = -1;
         }
     }
+    if (vfs->high_fds) {
+        for (uint32_t i = 0; i < vfs->max_high_fd_used && i < DETHV_MAX_HIGH_FDS; i++) {
+            if (vfs->high_fds[i].vfd.used && vfs->high_fds[i].vfd.host_fd >= 0) {
+                close(vfs->high_fds[i].vfd.host_fd);
+                vfs->high_fds[i].vfd.host_fd = -1;
+            }
+        }
+        free(vfs->high_fds);
+        vfs->high_fds = NULL;
+    }
     if (vfs->vfiles) {
         for (uint32_t i = 0; i < vfs->max_vfile_used && i < DETHV_MAX_VFILES; i++) {
+            vfile_free_sparse(&vfs->vfiles[i]);
             free(vfs->vfiles[i].data);
             vfs->vfiles[i].data = NULL;
         }
@@ -248,12 +553,51 @@ void vfs_destroy(vfs_state_t *vfs) {
     free(vfs->stderr_buf); vfs->stderr_buf = NULL;
 }
 
+static int clone_vfiles(vfs_state_t *dst, const vfs_state_t *src) {
+    uint32_t vf_lim = dst->max_vfile_used > src->max_vfile_used ? dst->max_vfile_used : src->max_vfile_used;
+    for (uint32_t i = 0; i < vf_lim && i < DETHV_MAX_VFILES; i++) {
+        if (i >= src->max_vfile_used || !src->vfiles[i].used) {
+            vfile_free_sparse(&dst->vfiles[i]);
+            dst->vfiles[i].used = false;
+            dst->vfiles[i].len = 0;
+            continue;
+        }
+        dst->vfiles[i].used   = true;
+        dst->vfiles[i].is_dir = src->vfiles[i].is_dir;
+        memcpy(dst->vfiles[i].path, src->vfiles[i].path, sizeof(dst->vfiles[i].path));
+        dst->vfiles[i].mode   = src->vfiles[i].mode;
+        dst->vfiles[i].len    = src->vfiles[i].len;
+        if (src->vfiles[i].sparse) {
+            if (vfile_clone_sparse(&dst->vfiles[i], &src->vfiles[i]) < 0) return -1;
+        } else {
+            vfile_free_sparse(&dst->vfiles[i]);
+            if (src->vfiles[i].len > 0 && src->vfiles[i].data) {
+                if (dst->vfiles[i].cap < src->vfiles[i].len || !dst->vfiles[i].data) {
+                    free(dst->vfiles[i].data);
+                    dst->vfiles[i].cap = src->vfiles[i].len;
+                    dst->vfiles[i].data = malloc(dst->vfiles[i].cap);
+                    if (!dst->vfiles[i].data) return -1;
+                }
+                memcpy(dst->vfiles[i].data, src->vfiles[i].data, src->vfiles[i].len);
+            }
+        }
+    }
+    dst->max_vfile_used = src->max_vfile_used;
+    return 0;
+}
+
 int vfs_clone(vfs_state_t *dst, const vfs_state_t *src) {
+    if (!dst->high_fds) {
+        dst->high_fds = calloc(DETHV_MAX_HIGH_FDS, sizeof(high_vfd_t));
+        if (dst->high_fds) {
+            for (int i = 0; i < DETHV_MAX_HIGH_FDS; i++) dst->high_fds[i].vfd.host_fd = -1;
+        }
+    }
     if (!dst->pipes)      dst->pipes      = calloc(DETHV_MAX_PIPES,  sizeof(vpipe_t));
     if (!dst->vfiles)     dst->vfiles     = calloc(DETHV_MAX_VFILES, sizeof(vfile_t));
     if (!dst->stdout_buf) dst->stdout_buf = malloc(DETHV_OUT_CAP);
     if (!dst->stderr_buf) dst->stderr_buf = malloc(DETHV_OUT_CAP);
-    if (!dst->pipes || !dst->vfiles || !dst->stdout_buf || !dst->stderr_buf) return -1;
+    if (!dst->high_fds || !dst->pipes || !dst->vfiles || !dst->stdout_buf || !dst->stderr_buf) return -1;
 
     uint32_t fds_lim = dst->max_fd_used > src->max_fd_used ? dst->max_fd_used : src->max_fd_used;
     for (uint32_t i = 0; i < fds_lim && i < DETHV_MAX_FDS; i++) {
@@ -262,9 +606,22 @@ int vfs_clone(vfs_state_t *dst, const vfs_state_t *src) {
             dst->fds[i].host_fd = -1;
         }
     }
-
     if (fds_lim > 0) memcpy(dst->fds, src->fds, fds_lim * sizeof(vfd_t));
     dst->max_fd_used = src->max_fd_used;
+
+    uint32_t hlim = dst->max_high_fd_used > src->max_high_fd_used ? dst->max_high_fd_used : src->max_high_fd_used;
+    for (uint32_t i = 0; i < hlim && i < DETHV_MAX_HIGH_FDS; i++) {
+        if (dst->high_fds[i].vfd.used && dst->high_fds[i].vfd.host_fd >= 0) {
+            close(dst->high_fds[i].vfd.host_fd);
+            dst->high_fds[i].vfd.host_fd = -1;
+        }
+    }
+    if (hlim > 0 && src->high_fds) {
+        memcpy(dst->high_fds, src->high_fds, hlim * sizeof(high_vfd_t));
+    } else if (hlim > 0) {
+        memset(dst->high_fds, 0, hlim * sizeof(high_vfd_t));
+    }
+    dst->max_high_fd_used = src->high_fds ? src->max_high_fd_used : 0;
 
     for (int i = 0; i < DETHV_MAX_PIPES; i++) {
         if (src->pipes[i].used || dst->pipes[i].used) {
@@ -287,6 +644,13 @@ int vfs_clone(vfs_state_t *dst, const vfs_state_t *src) {
             dst->fds[i].host_fd = -1;
         }
     }
+    for (uint32_t i = 0; i < dst->max_high_fd_used; i++) {
+        if (dst->high_fds[i].vfd.used && dst->high_fds[i].vfd.kind == FD_HOST_RO && dst->high_fds[i].vfd.path[0]) {
+            dst->high_fds[i].vfd.host_fd = open(dst->high_fds[i].vfd.path, O_RDONLY | O_CLOEXEC);
+        } else {
+            dst->high_fds[i].vfd.host_fd = -1;
+        }
+    }
 
     if (src->stdout_len > 0) memcpy(dst->stdout_buf, src->stdout_buf, src->stdout_len);
     dst->stdout_len = src->stdout_len;
@@ -305,30 +669,7 @@ int vfs_clone(vfs_state_t *dst, const vfs_state_t *src) {
     dst->stdin_len = src->stdin_len;
     dst->stdin_pos = src->stdin_pos;
 
-    uint32_t vf_lim = dst->max_vfile_used > src->max_vfile_used ? dst->max_vfile_used : src->max_vfile_used;
-    for (uint32_t i = 0; i < vf_lim && i < DETHV_MAX_VFILES; i++) {
-        if (i >= src->max_vfile_used || !src->vfiles[i].used) {
-            dst->vfiles[i].used = false;
-            dst->vfiles[i].len = 0;
-            continue;
-        }
-        dst->vfiles[i].used   = true;
-        dst->vfiles[i].is_dir = src->vfiles[i].is_dir;
-        memcpy(dst->vfiles[i].path, src->vfiles[i].path, sizeof(dst->vfiles[i].path));
-        dst->vfiles[i].mode   = src->vfiles[i].mode;
-        dst->vfiles[i].len    = src->vfiles[i].len;
-        if (src->vfiles[i].len > 0 && src->vfiles[i].data) {
-            if (dst->vfiles[i].cap < src->vfiles[i].len || !dst->vfiles[i].data) {
-                free(dst->vfiles[i].data);
-                dst->vfiles[i].cap = src->vfiles[i].len;
-                dst->vfiles[i].data = malloc(dst->vfiles[i].cap);
-                if (!dst->vfiles[i].data) return -1;
-            }
-            memcpy(dst->vfiles[i].data, src->vfiles[i].data, src->vfiles[i].len);
-        }
-    }
-    dst->max_vfile_used = src->max_vfile_used;
-    return 0;
+    return clone_vfiles(dst, src);
 }
 
 int vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src) {
@@ -349,6 +690,25 @@ int vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src) {
                 dst->fds[i].host_fd = -1;
             }
         }
+        uint32_t hlim = dst->max_high_fd_used > src->max_high_fd_used ? dst->max_high_fd_used : src->max_high_fd_used;
+        if (dst->high_fds && hlim > 0) {
+            for (uint32_t i = 0; i < hlim && i < DETHV_MAX_HIGH_FDS; i++) {
+                if (dst->high_fds[i].vfd.used && dst->high_fds[i].vfd.host_fd >= 0) {
+                    close(dst->high_fds[i].vfd.host_fd);
+                    dst->high_fds[i].vfd.host_fd = -1;
+                }
+            }
+            if (src->high_fds) memcpy(dst->high_fds, src->high_fds, hlim * sizeof(high_vfd_t));
+            else memset(dst->high_fds, 0, hlim * sizeof(high_vfd_t));
+            dst->max_high_fd_used = src->high_fds ? src->max_high_fd_used : 0;
+            for (uint32_t i = 0; i < dst->max_high_fd_used; i++) {
+                if (dst->high_fds[i].vfd.used && dst->high_fds[i].vfd.kind == FD_HOST_RO && dst->high_fds[i].vfd.path[0]) {
+                    dst->high_fds[i].vfd.host_fd = open(dst->high_fds[i].vfd.path, O_RDONLY | O_CLOEXEC);
+                } else {
+                    dst->high_fds[i].vfd.host_fd = -1;
+                }
+            }
+        }
         dst->fds_dirty = false;
     } else {
         for (uint32_t i = 0; i < dst->max_fd_used; i++) {
@@ -356,6 +716,15 @@ int vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src) {
                 dst->fds[i].offset      = src->fds[i].offset;
                 dst->fds[i].flags       = src->fds[i].flags;
                 dst->fds[i].eventfd_val = src->fds[i].eventfd_val;
+            }
+        }
+        if (dst->high_fds && src->high_fds) {
+            for (uint32_t i = 0; i < dst->max_high_fd_used; i++) {
+                if (dst->high_fds[i].vfd.used) {
+                    dst->high_fds[i].vfd.offset      = src->high_fds[i].vfd.offset;
+                    dst->high_fds[i].vfd.flags       = src->high_fds[i].vfd.flags;
+                    dst->high_fds[i].vfd.eventfd_val = src->high_fds[i].vfd.eventfd_val;
+                }
             }
         }
     }
@@ -370,29 +739,7 @@ int vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src) {
     }
 
     if (dst->vfiles_dirty) {
-        uint32_t lim = dst->max_vfile_used > src->max_vfile_used ? dst->max_vfile_used : src->max_vfile_used;
-        for (uint32_t i = 0; i < lim; i++) {
-            if (i >= src->max_vfile_used || !src->vfiles[i].used) {
-                dst->vfiles[i].used = false;
-                dst->vfiles[i].len = 0;
-                continue;
-            }
-            dst->vfiles[i].used   = true;
-            dst->vfiles[i].is_dir = src->vfiles[i].is_dir;
-            memcpy(dst->vfiles[i].path, src->vfiles[i].path, sizeof(dst->vfiles[i].path));
-            dst->vfiles[i].mode   = src->vfiles[i].mode;
-            dst->vfiles[i].len    = src->vfiles[i].len;
-            if (src->vfiles[i].len > 0 && src->vfiles[i].data) {
-                if (dst->vfiles[i].cap < src->vfiles[i].len || !dst->vfiles[i].data) {
-                    free(dst->vfiles[i].data);
-                    dst->vfiles[i].cap = src->vfiles[i].len;
-                    dst->vfiles[i].data = malloc(dst->vfiles[i].cap);
-                    if (!dst->vfiles[i].data) return -1;
-                }
-                memcpy(dst->vfiles[i].data, src->vfiles[i].data, src->vfiles[i].len);
-            }
-        }
-        dst->max_vfile_used = src->max_vfile_used;
+        if (clone_vfiles(dst, src) < 0) return -1;
         dst->vfiles_dirty = false;
     }
 
@@ -446,7 +793,10 @@ int vfs_alloc_fd(vfs_state_t *vfs, int min_fd) {
             return i;
         }
     }
-    return -EMFILE;
+    int cand = min_fd >= DETHV_MAX_FDS ? min_fd : DETHV_MAX_FDS;
+    while (cand <= DETHV_MAX_FD_NUM && vfs_get_fd(vfs, cand) != NULL) cand++;
+    if (cand > DETHV_MAX_FD_NUM) return -EMFILE;
+    return vfs_alloc_exact_fd(vfs, cand) ? cand : -EMFILE;
 }
 
 static bool generate_proc_file(dethv_vm_t *vm, const char *path, char *buf, size_t cap, size_t *len_out) {
@@ -487,10 +837,44 @@ static bool generate_proc_file(dethv_vm_t *vm, const char *path, char *buf, size
             "btime 1700000000\nprocesses 1000\nprocs_running 1\n");
         return true;
     }
-    if (strcmp(path, "/proc/self/stat") == 0) {
+    if (strcmp(path, "/proc/self/stat") == 0 ||
+        (strncmp(path, "/proc/", 6) == 0 && path[6] >= '0' && path[6] <= '9' &&
+         strstr(path, "/stat") != NULL && strcmp(path + strlen(path) - 5, "/stat") == 0)) {
         *len_out = (size_t)snprintf(buf, cap,
-            "%d (guest) R 1 %d %d 0 -1 4194304 100 0 0 0 10 10 0 0 20 0 %d 0 1 1048576 256\n",
+            "%d (guest) R 1 %d %d 0 -1 4194304 100 0 0 0 10 10 0 0 20 0 %d 0 1 1048576 256 "
+            "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
             vm->sched.pid, vm->sched.pid, vm->sched.pid, sched_num_alive(&vm->sched));
+        return true;
+    }
+    if (strncmp(path, "/proc/", 6) == 0 && path[6] >= '0' && path[6] <= '9' &&
+        strlen(path) > 6 && strcmp(path + strlen(path) - 6, "/sched") == 0) {
+        *len_out = (size_t)snprintf(buf, cap,
+            "guest (%d, #threads: %d)\n"
+            "-------------------------------------------------------------------\n"
+            "se.sum_exec_runtime                          :             1.000000\n"
+            "nr_switches                                  :                    1\n"
+            "nr_voluntary_switches                        :                    1\n"
+            "nr_involuntary_switches                      :                    0\n",
+            vm->sched.pid, sched_num_alive(&vm->sched));
+        return true;
+    }
+    if (strcmp(path, "/proc/interrupts") == 0) {
+        *len_out = (size_t)snprintf(buf, cap,
+            "           CPU0       \n"
+            "  0:          0   IO-APIC   2-edge      timer\n");
+        return true;
+    }
+    if (strcmp(path, "/proc/softirqs") == 0) {
+        *len_out = (size_t)snprintf(buf, cap,
+            "                    CPU0       \n"
+            "          HI:          0\n"
+            "       TIMER:          0\n"
+            "      NET_TX:          0\n"
+            "      NET_RX:          0\n");
+        return true;
+    }
+    if (strcmp(path, "/proc/vmstat") == 0) {
+        *len_out = (size_t)snprintf(buf, cap, "pgfault 0\npgmajfault 0\n");
         return true;
     }
     if (strcmp(path, "/proc/self/cmdline") == 0) {
@@ -504,11 +888,12 @@ static bool generate_proc_file(dethv_vm_t *vm, const char *path, char *buf, size
         size_t off = 0;
         for (uint32_t i = 0; i < vm->mmu.num_vmas && off + 128 < cap; i++) {
             vma_t *v = &vm->mmu.vmas[i];
-            off += (size_t)snprintf(buf + off, cap - off, "%012lx-%012lx %c%c%cp 00000000 00:00 0\n",
+            off += (size_t)snprintf(buf + off, cap - off, "%012lx-%012lx %c%c%c%c 00000000 00:00 0\n",
                 (unsigned long)v->start, (unsigned long)v->end,
                 (v->prot & PROT_READ) ? 'r' : '-',
                 (v->prot & PROT_WRITE) ? 'w' : '-',
-                (v->prot & PROT_EXEC) ? 'x' : '-');
+                (v->prot & PROT_EXEC) ? 'x' : '-',
+                (v->flags & MAP_SHARED) ? 's' : 'p');
         }
         *len_out = off;
         return true;
@@ -552,6 +937,30 @@ static bool generate_proc_file(dethv_vm_t *vm, const char *path, char *buf, size
         *len_out = (size_t)snprintf(buf, cap, "Linux version 6.8.0-dethv (dethv@dethv) (gcc 13.0) #1 SMP PREEMPT_DYNAMIC\n");
         return true;
     }
+    if (strcmp(path, "/proc/self/mounts") == 0 || strcmp(path, "/proc/mounts") == 0) {
+        *len_out = (size_t)snprintf(buf, cap,
+            "none /mnt/.fd/.huge hugetlbfs rw,relatime,pagesize=2M 0 0\n"
+            "none /mnt/.fd/.gigantic hugetlbfs rw,relatime,pagesize=1024M 0 0\n");
+        return true;
+    }
+    if (strcmp(path, "/proc/sys/vm/max_map_count") == 0) {
+        *len_out = (size_t)snprintf(buf, cap, "1000000\n");
+        return true;
+    }
+    if (strcmp(path, "/proc/sys/fs/file-max") == 0 ||
+        strcmp(path, "/proc/sys/fs/nr_open") == 0) {
+        *len_out = (size_t)snprintf(buf, cap, "1048576\n");
+        return true;
+    }
+    if (strcmp(path, "/proc/sys/kernel/numa_balancing") == 0) {
+        *len_out = (size_t)snprintf(buf, cap, "0\n");
+        return true;
+    }
+    if (strcmp(path, "/sys/devices/system/cpu/isolated") == 0 ||
+        strcmp(path, "/sys/devices/system/cpu/nohz_full") == 0) {
+        *len_out = (size_t)snprintf(buf, cap, "\n");
+        return true;
+    }
     if (strcmp(path, "/proc/loadavg") == 0) {
         *len_out = (size_t)snprintf(buf, cap, "0.10 0.10 0.10 1/%d %d\n",
             sched_num_alive(&vm->sched), vm->sched.pid);
@@ -563,6 +972,7 @@ static bool generate_proc_file(dethv_vm_t *vm, const char *path, char *buf, size
 static bool is_isolated_vpath(const char *full) {
     return (strcmp(full, "/tmp") == 0 || strncmp(full, "/tmp/", 5) == 0 ||
             strcmp(full, "/var/tmp") == 0 || strncmp(full, "/var/tmp/", 9) == 0 ||
+            strcmp(full, "/mnt/.fd") == 0 || strncmp(full, "/mnt/.fd/", 9) == 0 ||
             strcmp(full, "/proc") == 0 || strncmp(full, "/proc/", 6) == 0 ||
             strcmp(full, "/sys") == 0 || strncmp(full, "/sys/", 5) == 0 ||
             strcmp(full, "/dev") == 0 || strncmp(full, "/dev/", 5) == 0 ||
@@ -573,10 +983,36 @@ int vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t 
     char full[512];
     vfs_resolve_path(&vm->vfs, dirfd, path, full, sizeof(full));
 
+    /* Support /proc/self/fd/<N> reopening (used by Firedancer for RO accdb/store handles) */
+    if (strncmp(full, "/proc/self/fd/", 14) == 0 && full[14] >= '0' && full[14] <= '9') {
+        int target_fd = atoi(full + 14);
+        vfd_t *orig = vfs_get_fd(&vm->vfs, target_fd);
+        if (!orig) return -ENOENT;
+        int nfd = vfs_alloc_fd(&vm->vfs, 0);
+        if (nfd < 0) return nfd;
+        vfd_t *nf = (nfd < DETHV_MAX_FDS) ? &vm->vfs.fds[nfd] : vfs_alloc_exact_fd(&vm->vfs, nfd);
+        if (!nf) return -EMFILE;
+        *nf = *orig;
+        nf->used = true;
+        nf->flags = flags;
+        nf->offset = 0;
+        if (orig->host_fd >= 0 && orig->path[0]) {
+            nf->host_fd = open(orig->path, O_RDONLY | O_CLOEXEC);
+        } else {
+            nf->host_fd = -1;
+        }
+        if (orig->kind == FD_SOCKET) {
+            vm->net.sockets[orig->ref_idx].refcount++;
+        }
+        vm->vfs.fds_dirty = true;
+        return nfd;
+    }
+
     int fd = vfs_alloc_fd(&vm->vfs, 0);
     if (fd < 0) return fd;
 
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = (fd < DETHV_MAX_FDS) ? &vm->vfs.fds[fd] : vfs_alloc_exact_fd(&vm->vfs, fd);
+    if (!f) return -EMFILE;
     memset(f, 0, sizeof(*f));
     f->host_fd = -1;
     f->flags = flags;
@@ -590,7 +1026,7 @@ int vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t 
         f->cached_mode = S_IFCHR | 0666;
         return fd;
     }
-    if (strcmp(full, "/dev/null") == 0) {
+    if (strcmp(full, "/dev/null") == 0 || strcmp(full, "/proc/self/setgroups") == 0) {
         f->used = true; f->kind = FD_DEV_NULL; f->cached_mode = S_IFCHR | 0666;
         return fd;
     }
@@ -603,13 +1039,15 @@ int vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t 
         return fd;
     }
 
-    char pbuf[4096];
+    size_t pcap = (strcmp(full, "/proc/self/maps") == 0) ? 131072 : 4096;
+    char *pbuf = malloc(pcap);
     size_t plen = 0;
-    if (generate_proc_file(vm, full, pbuf, sizeof(pbuf), &plen)) {
+    if (pbuf && generate_proc_file(vm, full, pbuf, pcap, &plen)) {
         vm->vfs.vfiles_dirty = true;
         int vf_idx = alloc_vfile_slot(&vm->vfs, full, S_IFREG | 0444, false);
-        if (vf_idx < 0) return -ENOSPC;
+        if (vf_idx < 0) { free(pbuf); return -ENOSPC; }
         vfs_set_vfile_data(&vm->vfs, full, pbuf, plen);
+        free(pbuf);
         f->used = true;
         f->kind = FD_PROC_VFILE;
         f->ref_idx = (uint32_t)vf_idx;
@@ -617,6 +1055,7 @@ int vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t 
         f->cached_size = plen;
         return fd;
     }
+    free(pbuf);
 
     if (strcmp(full, "/etc/ld.so.preload") == 0) return -ENOENT;
 
@@ -713,8 +1152,8 @@ int vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t 
 }
 
 int64_t vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
 
     switch (f->kind) {
         case FD_STDIN: {
@@ -740,7 +1179,7 @@ int64_t vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count) {
             if (f->offset >= vf->len) return 0;
             size_t avail = vf->len - (size_t)f->offset;
             size_t n = count < avail ? count : avail;
-            memcpy(buf, vf->data + f->offset, n);
+            vfile_read_range(vf, f->offset, buf, n);
             f->offset += n;
             return (int64_t)n;
         }
@@ -798,8 +1237,8 @@ int64_t vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count) {
 
 int64_t vfs_pread(dethv_vm_t *vm, int fd, void *buf, size_t count, int64_t off) {
     if (off < 0) return -EINVAL;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     uint64_t saved = f->offset;
     f->offset = (uint64_t)off;
     int64_t r = vfs_read(vm, fd, buf, count);
@@ -810,8 +1249,17 @@ int64_t vfs_pread(dethv_vm_t *vm, int fd, void *buf, size_t count, int64_t off) 
 static int64_t vfile_write_at(dethv_vm_t *vm, uint32_t vf_idx, uint64_t off, const void *buf, size_t count) {
     vm->vfs.vfiles_dirty = true;
     vfile_t *vf = &vm->vfs.vfiles[vf_idx];
-    size_t end = (size_t)off + count;
-    if (end > 512ULL * 1024 * 1024) return -EFBIG;
+    uint64_t end = off + count;
+    if (end > VFILE_SPARSE_MAX_SIZE) return -EFBIG;
+    if (vf->sparse || end > VFILE_SPARSE_THRESHOLD) {
+        if (!vf->sparse && vfile_make_sparse(vf) < 0) return -ENOSPC;
+        if (count > 0) {
+            int rc = vfile_write_sparse_range(vf, off, buf, count);
+            if (rc < 0) return rc;
+        }
+        if (end > vf->len) vf->len = (size_t)end;
+        return (int64_t)count;
+    }
     if (end > vf->cap) {
         size_t ncap = vf->cap ? vf->cap * 2 : 4096;
         while (ncap < end) ncap *= 2;
@@ -822,13 +1270,13 @@ static int64_t vfile_write_at(dethv_vm_t *vm, uint32_t vf_idx, uint64_t off, con
         vf->cap = ncap;
     }
     if (count > 0) memcpy(vf->data + off, buf, count);
-    if (end > vf->len) vf->len = end;
+    if (end > vf->len) vf->len = (size_t)end;
     return (int64_t)count;
 }
 
 int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
 
     switch (f->kind) {
         case FD_STDOUT: {
@@ -910,23 +1358,43 @@ int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count) {
 
 int64_t vfs_pwrite(dethv_vm_t *vm, int fd, const void *buf, size_t count, int64_t off) {
     if (off < 0) return -EINVAL;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     if (f->kind != FD_MEM_VFILE) return -EINVAL;
     int64_t r = vfile_write_at(vm, f->ref_idx, (uint64_t)off, buf, count);
     if (r >= 0) f->cached_size = vm->vfs.vfiles[f->ref_idx].len;
     return r;
 }
 
-int vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length) {
-    if (length < 0) return -EINVAL;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
-    if (f->kind != FD_MEM_VFILE) return -EINVAL;
-    vm->vfs.vfiles_dirty = true;
-    vfile_t *vf = &vm->vfs.vfiles[f->ref_idx];
-    size_t nlen = (size_t)length;
-    if (nlen > 512ULL * 1024 * 1024) return -EFBIG;
+static int vfile_truncate_internal(vfile_t *vf, size_t nlen) {
+    if (nlen > VFILE_SPARSE_MAX_SIZE) return -EFBIG;
+    if (vf->sparse || nlen > VFILE_SPARSE_THRESHOLD) {
+        if (!vf->sparse && vfile_make_sparse(vf) < 0) return -ENOSPC;
+        if (nlen < vf->len && vf->l1_pages) {
+            uint64_t keep_pages = (nlen + PAGE_SIZE - 1) >> 12;
+            uint32_t keep_l1 = (uint32_t)(keep_pages / VFILE_L2_SLOTS);
+            uint32_t keep_l2 = (uint32_t)(keep_pages % VFILE_L2_SLOTS);
+            for (uint32_t l1 = keep_l1; l1 < VFILE_L1_SLOTS; l1++) {
+                if (!vf->l1_pages[l1]) continue;
+                uint32_t start_l2 = (l1 == keep_l1) ? keep_l2 : 0;
+                for (uint32_t l2 = start_l2; l2 < VFILE_L2_SLOTS; l2++) {
+                    free(vf->l1_pages[l1][l2]);
+                    vf->l1_pages[l1][l2] = NULL;
+                }
+            }
+            if ((nlen & (PAGE_SIZE - 1)) && keep_pages > 0) {
+                uint64_t last_p = keep_pages - 1;
+                uint32_t l1 = (uint32_t)(last_p / VFILE_L2_SLOTS);
+                uint32_t l2 = (uint32_t)(last_p % VFILE_L2_SLOTS);
+                if (l1 < VFILE_L1_SLOTS && vf->l1_pages[l1] && vf->l1_pages[l1][l2]) {
+                    size_t tail = nlen & (PAGE_SIZE - 1);
+                    memset(vf->l1_pages[l1][l2] + tail, 0, PAGE_SIZE - tail);
+                }
+            }
+        }
+        vf->len = nlen;
+        return 0;
+    }
     if (nlen > vf->cap) {
         size_t ncap = vf->cap ? vf->cap * 2 : 4096;
         while (ncap < nlen) ncap *= 2;
@@ -939,8 +1407,19 @@ int vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length) {
         memset(vf->data + vf->len, 0, nlen - vf->len);
     }
     vf->len = nlen;
-    f->cached_size = nlen;
     return 0;
+}
+
+int vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length) {
+    if (length < 0) return -EINVAL;
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
+    if (f->kind != FD_MEM_VFILE) return -EINVAL;
+    vm->vfs.vfiles_dirty = true;
+    vfile_t *vf = &vm->vfs.vfiles[f->ref_idx];
+    int rc = vfile_truncate_internal(vf, (size_t)length);
+    if (rc == 0) f->cached_size = (size_t)length;
+    return rc;
 }
 
 int vfs_truncate_path(dethv_vm_t *vm, const char *path, int64_t length) {
@@ -952,23 +1431,12 @@ int vfs_truncate_path(dethv_vm_t *vm, const char *path, int64_t length) {
     vfile_t *vf = &vm->vfs.vfiles[idx];
     if (vf->is_dir) return -EISDIR;
     vm->vfs.vfiles_dirty = true;
-    size_t nlen = (size_t)length;
-    if (nlen > vf->cap) {
-        uint8_t *nb = realloc(vf->data, nlen);
-        if (!nb) return -ENOSPC;
-        memset(nb + vf->cap, 0, nlen - vf->cap);
-        vf->data = nb;
-        vf->cap = nlen;
-    } else if (nlen > vf->len) {
-        memset(vf->data + vf->len, 0, nlen - vf->len);
-    }
-    vf->len = nlen;
-    return 0;
+    return vfile_truncate_internal(vf, (size_t)length);
 }
 
 int64_t vfs_lseek(dethv_vm_t *vm, int fd, int64_t off, int whence) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     if (f->kind == FD_PIPE_READ || f->kind == FD_PIPE_WRITE ||
         f->kind == FD_STDIN || f->kind == FD_STDOUT || f->kind == FD_STDERR ||
         f->kind == FD_SOCKET || f->kind == FD_EPOLL || f->kind == FD_EVENTFD || f->kind == FD_TIMERFD)
@@ -990,51 +1458,69 @@ int64_t vfs_lseek(dethv_vm_t *vm, int fd, int64_t off, int whence) {
 }
 
 int vfs_close(dethv_vm_t *vm, int fd) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     vm->vfs.fds_dirty = true;
+    fd_kind_t kind = f->kind;
+    uint32_t ref_idx = f->ref_idx;
     if (f->host_fd >= 0) {
         close(f->host_fd);
         f->host_fd = -1;
     }
-    if (f->kind == FD_PIPE_READ)  { vm->vfs.pipes[f->ref_idx].read_closed = true;  vm->vfs.pipes[f->ref_idx].io_gen++; vm->vfs.pipes_dirty = true; net_wake_io_waiters(vm); }
-    if (f->kind == FD_PIPE_WRITE) { vm->vfs.pipes[f->ref_idx].write_closed = true; vm->vfs.pipes[f->ref_idx].io_gen++; vm->vfs.pipes_dirty = true; net_wake_io_waiters(vm); }
-    if (f->kind == FD_SOCKET)     net_close_socket(vm, f->ref_idx);
-    if (f->kind == FD_EPOLL)      net_close_epoll(vm, f->ref_idx);
-    if (f->kind == FD_TIMERFD)    net_close_timer(vm, f->ref_idx);
-    if (f->kind == FD_IO_URING)   iouring_close(vm, f->ref_idx);
+    if (kind == FD_PIPE_READ)  { vm->vfs.pipes[ref_idx].read_closed = true;  vm->vfs.pipes[ref_idx].io_gen++; vm->vfs.pipes_dirty = true; net_wake_io_waiters(vm); }
+    if (kind == FD_PIPE_WRITE) { vm->vfs.pipes[ref_idx].write_closed = true; vm->vfs.pipes[ref_idx].io_gen++; vm->vfs.pipes_dirty = true; net_wake_io_waiters(vm); }
+    if (kind == FD_SOCKET)     net_close_socket(vm, ref_idx);
+    if (kind == FD_EPOLL)      net_close_epoll(vm, ref_idx);
+    if (kind == FD_TIMERFD)    net_close_timer(vm, ref_idx);
+    if (kind == FD_IO_URING)   iouring_close(vm, ref_idx);
     f->used = false;
+    /* Reclaim POSIX unlinked-while-open vfile when last FD closes */
+    if (kind == FD_MEM_VFILE && ref_idx < vm->vfs.max_vfile_used) {
+        vfile_t *vf = &vm->vfs.vfiles[ref_idx];
+        if (vf->used && vf->path[0] == '\0' && !vfile_has_open_fds(&vm->vfs, ref_idx)) {
+            vfile_free_sparse(vf);
+            vf->used = false;
+            vf->len = 0;
+            vm->vfs.vfiles_dirty = true;
+        }
+    }
     return 0;
 }
 
 int vfs_dup(dethv_vm_t *vm, int oldfd, int newfd, int flags, bool exact) {
-    if (oldfd < 0 || oldfd >= DETHV_MAX_FDS || !vm->vfs.fds[oldfd].used) return -EBADF;
+    vfd_t *src = vfs_get_fd(&vm->vfs, oldfd);
+    if (!src) return -EBADF;
+    vfd_t src_copy = *src;
     vm->vfs.fds_dirty = true;
     int dst_fd;
+    vfd_t *dst = NULL;
     if (exact) {
-        if (newfd < 0 || newfd >= DETHV_MAX_FDS) return -EBADF;
+        if (newfd < 0 || newfd > DETHV_MAX_FD_NUM) return -EBADF;
         if (newfd == oldfd) return newfd;
-        if (vm->vfs.fds[newfd].used) vfs_close(vm, newfd);
+        if (vfs_get_fd(&vm->vfs, newfd)) vfs_close(vm, newfd);
         dst_fd = newfd;
-        if ((uint32_t)(dst_fd + 1) > vm->vfs.max_fd_used) vm->vfs.max_fd_used = (uint32_t)(dst_fd + 1);
+        dst = vfs_alloc_exact_fd(&vm->vfs, dst_fd);
+        if (!dst) return -EMFILE;
     } else {
         dst_fd = vfs_alloc_fd(&vm->vfs, newfd >= 0 ? newfd : 0);
         if (dst_fd < 0) return dst_fd;
+        dst = (dst_fd < DETHV_MAX_FDS) ? &vm->vfs.fds[dst_fd] : vfs_alloc_exact_fd(&vm->vfs, dst_fd);
+        if (!dst) return -EMFILE;
     }
-    vm->vfs.fds[dst_fd] = vm->vfs.fds[oldfd];
-    if (vm->vfs.fds[oldfd].host_fd >= 0) {
-        vm->vfs.fds[dst_fd].host_fd = open(vm->vfs.fds[oldfd].path, O_RDONLY | O_CLOEXEC);
+    *dst = src_copy;
+    if (src_copy.host_fd >= 0) {
+        dst->host_fd = open(src_copy.path, O_RDONLY | O_CLOEXEC);
     }
-    if (vm->vfs.fds[oldfd].kind == FD_SOCKET) {
-        vm->net.sockets[vm->vfs.fds[oldfd].ref_idx].refcount++;
+    if (src_copy.kind == FD_SOCKET) {
+        vm->net.sockets[src_copy.ref_idx].refcount++;
     }
-    if (flags & O_CLOEXEC) vm->vfs.fds[dst_fd].flags |= O_CLOEXEC;
+    if (flags & O_CLOEXEC) dst->flags |= O_CLOEXEC;
     return dst_fd;
 }
 
 int vfs_fstat(dethv_vm_t *vm, int fd, void *statbuf_out) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     struct stat st;
 
     switch (f->kind) {
@@ -1155,12 +1641,18 @@ int vfs_unlink(dethv_vm_t *vm, int dirfd, const char *path, int flags) {
     if (idx < 0) return -ENOENT;
     if (vm->vfs.vfiles[idx].is_dir && !(flags & AT_REMOVEDIR)) return -EISDIR;
     vm->vfs.vfiles_dirty = true;
+    if (!vm->vfs.vfiles[idx].is_dir && vfile_has_open_fds(&vm->vfs, (uint32_t)idx)) {
+        /* Keep inode alive until last open FD referencing it closes (POSIX unlink semantics) */
+        vm->vfs.vfiles[idx].path[0] = '\0';
+        return 0;
+    }
+    vfile_free_sparse(&vm->vfs.vfiles[idx]);
     vm->vfs.vfiles[idx].used = false;
     vm->vfs.vfiles[idx].len = 0;
     return 0;
 }
 
-int vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+int vfs_rename_ex(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) {
     char old_full[512], new_full[512];
     vfs_resolve_path(&vm->vfs, olddirfd, oldpath, old_full, sizeof(old_full));
     vfs_resolve_path(&vm->vfs, newdirfd, newpath, new_full, sizeof(new_full));
@@ -1171,9 +1663,23 @@ int vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, 
 
     vm->vfs.vfiles_dirty = true;
     int nidx = find_vfile_idx(&vm->vfs, new_full);
+    if (flags & 2U /* RENAME_EXCHANGE */) {
+        if (nidx < 0) return -ENOENT;
+        char tmp[512];
+        memcpy(tmp, vm->vfs.vfiles[oidx].path, sizeof(tmp));
+        memcpy(vm->vfs.vfiles[oidx].path, vm->vfs.vfiles[nidx].path, sizeof(vm->vfs.vfiles[oidx].path));
+        memcpy(vm->vfs.vfiles[nidx].path, tmp, sizeof(vm->vfs.vfiles[nidx].path));
+        return 0;
+    }
+    if ((flags & 1U /* RENAME_NOREPLACE */) && nidx >= 0) return -EEXIST;
     if (nidx >= 0) {
-        vm->vfs.vfiles[nidx].used = false;
-        vm->vfs.vfiles[nidx].len = 0;
+        if (!vm->vfs.vfiles[nidx].is_dir && vfile_has_open_fds(&vm->vfs, (uint32_t)nidx)) {
+            vm->vfs.vfiles[nidx].path[0] = '\0';
+        } else {
+            vfile_free_sparse(&vm->vfs.vfiles[nidx]);
+            vm->vfs.vfiles[nidx].used = false;
+            vm->vfs.vfiles[nidx].len = 0;
+        }
     }
 
     /* If renaming a directory, also rename all child paths */
@@ -1191,6 +1697,10 @@ int vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, 
     }
     snprintf(vm->vfs.vfiles[oidx].path, sizeof(vm->vfs.vfiles[oidx].path), "%s", new_full);
     return 0;
+}
+
+int vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+    return vfs_rename_ex(vm, olddirfd, oldpath, newdirfd, newpath, 0);
 }
 
 int vfs_link(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
@@ -1215,8 +1725,8 @@ struct klinux_dirent64 {
 };
 
 int64_t vfs_getdents64(dethv_vm_t *vm, int fd, void *buf, size_t count) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     if (f->kind != FD_DIR) return -ENOTDIR;
 
     const char *dir_path = f->path;
@@ -1238,7 +1748,7 @@ int64_t vfs_getdents64(dethv_vm_t *vm, int fd, void *buf, size_t count) {
             name = ".."; dtype = DT_DIR;
         } else {
             vfile_t *vf = &vm->vfs.vfiles[f->offset - 2];
-            if (vf->used) {
+            if (vf->used && vf->path[0]) {
                 const char *vp = vf->path;
                 const char *child = NULL;
                 if (is_root) {
@@ -1293,15 +1803,17 @@ int vfs_pipe(dethv_vm_t *vm, int fds_out[2], int flags) {
 
     int rfd = vfs_alloc_fd(&vm->vfs, 0);
     if (rfd < 0) return rfd;
-    vm->vfs.fds[rfd].used = true;
+    vfd_t *rf = (rfd < DETHV_MAX_FDS) ? &vm->vfs.fds[rfd] : vfs_alloc_exact_fd(&vm->vfs, rfd);
+    rf->used = true;
     int wfd = vfs_alloc_fd(&vm->vfs, rfd + 1);
-    if (wfd < 0) { vm->vfs.fds[rfd].used = false; return wfd; }
+    if (wfd < 0) { rf->used = false; return wfd; }
+    vfd_t *wf = (wfd < DETHV_MAX_FDS) ? &vm->vfs.fds[wfd] : vfs_alloc_exact_fd(&vm->vfs, wfd);
 
     memset(&vm->vfs.pipes[p_idx], 0, sizeof(vpipe_t));
     vm->vfs.pipes[p_idx].used = true;
 
-    vm->vfs.fds[rfd] = (vfd_t){ .used = true, .kind = FD_PIPE_READ,  .flags = flags, .host_fd = -1, .ref_idx = (uint32_t)p_idx, .path = "pipe:[r]" };
-    vm->vfs.fds[wfd] = (vfd_t){ .used = true, .kind = FD_PIPE_WRITE, .flags = flags, .host_fd = -1, .ref_idx = (uint32_t)p_idx, .path = "pipe:[w]" };
+    *rf = (vfd_t){ .used = true, .kind = FD_PIPE_READ,  .flags = flags, .host_fd = -1, .ref_idx = (uint32_t)p_idx, .path = "pipe:[r]" };
+    *wf = (vfd_t){ .used = true, .kind = FD_PIPE_WRITE, .flags = flags, .host_fd = -1, .ref_idx = (uint32_t)p_idx, .path = "pipe:[w]" };
     fds_out[0] = rfd;
     fds_out[1] = wfd;
     return 0;
@@ -1311,10 +1823,11 @@ int vfs_eventfd(dethv_vm_t *vm, uint64_t initval, int flags) {
     vm->vfs.fds_dirty = true;
     int fd = vfs_alloc_fd(&vm->vfs, 0);
     if (fd < 0) return fd;
+    vfd_t *f = (fd < DETHV_MAX_FDS) ? &vm->vfs.fds[fd] : vfs_alloc_exact_fd(&vm->vfs, fd);
     int f_flags = 0;
     if (flags & 04000) f_flags |= O_NONBLOCK; /* EFD_NONBLOCK */
     if (flags & 02000000) f_flags |= O_CLOEXEC; /* EFD_CLOEXEC */
-    vm->vfs.fds[fd] = (vfd_t){
+    *f = (vfd_t){
         .used = true, .kind = FD_EVENTFD, .flags = f_flags,
         .host_fd = -1, .eventfd_val = initval, .path = "anon_inode:[eventfd]"
     };

@@ -182,7 +182,7 @@ static void sync_single_shared_vma(dethv_vm_t *vm, const vma_t *v) {
         if (foff >= vf->len) break;
         size_t chunk = PAGE_SIZE;
         if (foff + chunk > vf->len) chunk = (size_t)(vf->len - foff);
-        memcpy(vf->data + foff, vm->mem + (pa & PAGE_MASK), chunk);
+        vfile_write_page(vf, foff, vm->mem + (pa & PAGE_MASK), chunk);
     }
 }
 
@@ -266,8 +266,11 @@ void mmu_set_vma_vfile(dethv_vm_t *vm, uint64_t start, int32_t vfile_idx, uint64
     }
 }
 
-uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, bool populate) {
+uint64_t mmu_mmap_region_aligned(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot,
+                                 uint32_t flags, bool populate, uint64_t align) {
     if (len == 0) return (uint64_t)-22;
+    if (align < PAGE_SIZE) align = PAGE_SIZE;
+    uint64_t align_mask = align - 1ULL;
     size_t aligned_len = PAGE_ALIGN_UP(len);
     uint64_t base = 0;
 
@@ -278,24 +281,25 @@ uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t pro
         for (uint64_t va = base; va < base + aligned_len; va += PAGE_SIZE) {
             mmu_unmap_page(vm, va);
         }
-    } else if (hint && !(hint & (PAGE_SIZE - 1)) &&
+    } else if (hint && !(hint & align_mask) &&
                hint >= 0x10000ULL && hint + aligned_len < GUEST_STACK_TOP - GUEST_STACK_SIZE &&
                !vma_find_overlap(&vm->mmu, hint, hint + aligned_len)) {
         base = hint;
     } else {
-        /* Deterministic top-down allocation with O(1) overlap jump */
-        uint64_t cand = (vm->mmu.mmap_cursor > aligned_len) ? PAGE_ALIGN_DOWN(vm->mmu.mmap_cursor - aligned_len) : 0;
+        /* Deterministic top-down allocation with O(1) overlap jump & alignment */
+        uint64_t cand = (vm->mmu.mmap_cursor > aligned_len)
+                        ? ((vm->mmu.mmap_cursor - aligned_len) & ~align_mask) : 0;
         const vma_t *ov;
         while (cand >= 0x10000000ULL && (ov = vma_find_overlap(&vm->mmu, cand, cand + aligned_len)) != NULL) {
             if (ov->start <= aligned_len) { cand = 0; break; }
-            cand = PAGE_ALIGN_DOWN(ov->start - aligned_len);
+            cand = (ov->start - aligned_len) & ~align_mask;
         }
         /* Wrap around to top of mmap arena if cursor reached bottom (reclaims unmapped gaps!) */
         if (cand < 0x10000000ULL) {
-            cand = PAGE_ALIGN_DOWN(GUEST_MMAP_TOP - aligned_len);
+            cand = (GUEST_MMAP_TOP - aligned_len) & ~align_mask;
             while (cand >= 0x10000000ULL && (ov = vma_find_overlap(&vm->mmu, cand, cand + aligned_len)) != NULL) {
                 if (ov->start <= aligned_len) { cand = 0; break; }
-                cand = PAGE_ALIGN_DOWN(ov->start - aligned_len);
+                cand = (ov->start - aligned_len) & ~align_mask;
             }
         }
         if (cand < 0x10000000ULL) return (uint64_t)-12;
@@ -314,6 +318,10 @@ uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t pro
         }
     }
     return base;
+}
+
+uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, bool populate) {
+    return mmu_mmap_region_aligned(vm, hint, len, prot, flags, populate, PAGE_SIZE);
 }
 
 int mmu_munmap_region(dethv_vm_t *vm, uint64_t addr, size_t len) {
@@ -420,6 +428,13 @@ bool mmu_handle_page_fault(dethv_vm_t *vm, uint64_t cr2, uint64_t errcode) {
 
     uint64_t pa = mmu_alloc_phys_page(vm);
     if (!pa) return false;
+    if (vma->vfile_idx >= 0 && (uint32_t)vma->vfile_idx < vm->vfs.max_vfile_used) {
+        const vfile_t *vf = &vm->vfs.vfiles[vma->vfile_idx];
+        if (vf->used && !vf->is_dir) {
+            uint64_t foff = vma->file_off + (page_va - vma->start);
+            vfile_read_page(vf, foff, vm->mem + pa);
+        }
+    }
     if (mmu_map_page(vm, page_va, pa, prot_to_pte(vma->prot)) < 0) return false;
     return true;
 }

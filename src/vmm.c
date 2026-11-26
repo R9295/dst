@@ -97,10 +97,10 @@ static int setup_deterministic_cpuid(dethv_vm_t *vm) {
                     e->ecx &= ~(1U << 22); /* Clear RDPID */
                     e->ebx &= ~(1U << 20); /* Clear SMAP (keep Ring-0 fast access to user rip) */
                     e->ebx &= ~(1U << 7);  /* Clear SMEP */
-                    /* Clear AVX-512 bits so XSAVE stays compact & glibc uses fast AVX2 */
+                    /* Clear AVX-512 bits & WAITPKG (ECX[5]) so XSAVE stays compact & no UMWAIT */
                     e->ebx &= ~((1U << 16) | (1U << 17) | (1U << 21) | (1U << 26) |
                                 (1U << 27) | (1U << 28) | (1U << 30) | (1U << 31));
-                    e->ecx &= ~((1U << 1) | (1U << 6) | (1U << 11) | (1U << 12) | (1U << 14));
+                    e->ecx &= ~((1U << 1) | (1U << 5) | (1U << 6) | (1U << 11) | (1U << 12) | (1U << 14));
                 }
                 break;
             case 0x0B:
@@ -118,7 +118,8 @@ static int setup_deterministic_cpuid(dethv_vm_t *vm) {
                 }
                 break;
             case 0x80000001:
-                /* Keep NX, LM, SYSCALL, RDTSCP (we emulate RDTSCP deterministically!) */
+                /* Keep NX, LM, SYSCALL, RDTSCP (emulated deterministically); clear MWAITX (ECX[29]) */
+                e->ecx &= ~(1U << 29);
                 break;
             case 0x80000008:
                 /* Clear RDPRU (EBX[4]), 1 CPU core (ECX[7:0]=0) */
@@ -466,6 +467,7 @@ fail:
 
 void dethv_destroy(dethv_vm_t *vm) {
     if (!vm) return;
+    fork_free_all(vm);
     iouring_destroy(vm);
     net_destroy(&vm->net);
     vfs_destroy(&vm->vfs);

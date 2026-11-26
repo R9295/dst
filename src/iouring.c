@@ -270,9 +270,10 @@ int iouring_sys_setup(dethv_vm_t *vm, uint32_t entries, uint64_t params_guest) {
 }
 
 uint64_t iouring_mmap(dethv_vm_t *vm, int fd, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, int64_t off) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_IO_URING)
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_IO_URING)
         return (uint64_t)-EBADF;
-    viouring_t *ur = &vm->iourings[vm->vfs.fds[fd].ref_idx];
+    viouring_t *ur = &vm->iourings[f->ref_idx];
     if (!ur->used) return (uint64_t)-EBADF;
 
     uint64_t *phys_list = NULL;
@@ -369,12 +370,13 @@ static int32_t execute_sqe(dethv_vm_t *vm, const struct io_uring_sqe *sqe) {
             return (int32_t)r;
         }
 
-        case IORING_OP_FSYNC:
-            if (sqe->fd >= 0 && sqe->fd < DETHV_MAX_FDS && vm->vfs.fds[sqe->fd].used &&
-                vm->vfs.fds[sqe->fd].kind == FD_MEM_VFILE) {
-                mmu_sync_vfile_from_vmas(vm, (int32_t)vm->vfs.fds[sqe->fd].ref_idx);
+        case IORING_OP_FSYNC: {
+            vfd_t *ff = vfs_get_fd(&vm->vfs, sqe->fd);
+            if (ff && ff->kind == FD_MEM_VFILE) {
+                mmu_sync_vfile_from_vmas(vm, (int32_t)ff->ref_idx);
             }
             return 0;
+        }
 
         case IORING_OP_FALLOCATE:
             return 0;
@@ -416,9 +418,10 @@ static int32_t execute_sqe(dethv_vm_t *vm, const struct io_uring_sqe *sqe) {
 
 int iouring_sys_enter(dethv_vm_t *vm, int fd, uint32_t to_submit, uint32_t min_complete, uint32_t flags) {
     (void)min_complete; (void)flags;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_IO_URING)
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_IO_URING)
         return -EBADF;
-    viouring_t *ur = &vm->iourings[vm->vfs.fds[fd].ref_idx];
+    viouring_t *ur = &vm->iourings[f->ref_idx];
     if (!ur->used) return -EBADF;
 
     uint32_t sq_head = ring_read_u32(vm, ur, UR_OFF_SQ_HEAD);
@@ -463,7 +466,8 @@ int iouring_sys_enter(dethv_vm_t *vm, int fd, uint32_t to_submit, uint32_t min_c
 }
 
 int iouring_sys_register(dethv_vm_t *vm, int fd, uint32_t opcode, uint64_t arg, uint32_t nr_args) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_IO_URING)
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_IO_URING)
         return -EBADF;
     if (opcode == IORING_REGISTER_PROBE && arg != 0) {
         struct io_uring_probe probe;

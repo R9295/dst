@@ -1,12 +1,14 @@
 #include "internal.h"
 #include "dethv_guest.h"
 #include "syscalls.h"
+#include <arpa/inet.h>
 #include <asm/prctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <linux/sched.h>
 #include <linux/stat.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,8 +50,32 @@ static void fill_statx_from_stat(struct statx *sx, const struct stat *st) {
     sx->stx_dev_minor    = 1;
 }
 
-static void fill_det_statfs(struct statfs *sf) {
+static void fill_det_statfs(struct statfs *sf, const char *path) {
     memset(sf, 0, sizeof(*sf));
+    if (path && strstr(path, "/.gigantic") != NULL) {
+        sf->f_type    = 0x958458f6; /* HUGETLBFS_MAGIC */
+        sf->f_bsize   = 1024 * 1024 * 1024;
+        sf->f_blocks  = 16;
+        sf->f_bfree   = 16;
+        sf->f_bavail  = 16;
+        sf->f_files   = 1024;
+        sf->f_ffree   = 1000;
+        sf->f_namelen = 255;
+        sf->f_frsize  = 1024 * 1024 * 1024;
+        return;
+    }
+    if (path && strstr(path, "/.huge") != NULL) {
+        sf->f_type    = 0x958458f6; /* HUGETLBFS_MAGIC */
+        sf->f_bsize   = 2 * 1024 * 1024;
+        sf->f_blocks  = 8192;
+        sf->f_bfree   = 8192;
+        sf->f_bavail  = 8192;
+        sf->f_files   = 4096;
+        sf->f_ffree   = 4000;
+        sf->f_namelen = 255;
+        sf->f_frsize  = 2 * 1024 * 1024;
+        return;
+    }
     sf->f_type    = 0x01021994; /* TMPFS_MAGIC */
     sf->f_bsize   = 4096;
     sf->f_blocks  = 26214400;   /* 100 GiB deterministic virtual disk */
@@ -59,6 +85,159 @@ static void fill_det_statfs(struct statfs *sf) {
     sf->f_ffree   = 990000;
     sf->f_namelen = 255;
     sf->f_frsize  = 4096;
+}
+
+/* ==================== Synchronous Early-Boot fork() Emulation ==================== */
+
+void fork_free_all(dethv_vm_t *vm) {
+    while (vm->fork_saved) {
+        fork_frame_t *ff = vm->fork_saved;
+        vm->fork_saved = ff->prev;
+        vfs_destroy(&ff->vfs);
+        free(ff->mem);
+        free(ff);
+    }
+}
+
+static int64_t handle_sync_fork(dethv_vm_t *vm, uint64_t flags, uint64_t child_stack, uint64_t child_tid_ptr) {
+    fork_frame_t *ff = calloc(1, sizeof(fork_frame_t));
+    if (!ff) return -ENOMEM;
+
+    ff->parent_pid      = vm->sched.pid;
+    ff->child_pid       = vm->sched.next_tid++;
+    ff->phys_used       = vm->mmu.next_phys;
+    ff->mem             = malloc(ff->phys_used);
+    if (!ff->mem) { free(ff); return -ENOMEM; }
+    memcpy(ff->mem, vm->mem, ff->phys_used);
+
+    ff->mmu             = vm->mmu;
+    ff->sched           = vm->sched;
+    ff->current_fs_base = vm->current_fs_base;
+    ff->parent_regs     = vm->shared->regs;
+    ff->parent_regs.rax = (uint64_t)ff->child_pid;
+    ioctl(vm->vcpu_fd, KVM_GET_XSAVE, &ff->parent_xsave);
+
+    for (int i = 0; i < DETHV_MAX_FDS; i++) ff->vfs.fds[i].host_fd = -1;
+    if (vfs_clone(&ff->vfs, &vm->vfs) < 0) {
+        vfs_destroy(&ff->vfs);
+        free(ff->mem);
+        free(ff);
+        return -ENOMEM;
+    }
+
+    ff->prev = vm->fork_saved;
+    vm->fork_saved = ff;
+
+    guest_thread_t *cur = &vm->sched.threads[vm->sched.current_idx];
+    vm->sched.pid = ff->child_pid;
+    cur->tid      = ff->child_pid;
+    if (child_stack != 0) {
+        vm->shared->regs.rsp = child_stack;
+    }
+    if ((flags & CLONE_CHILD_SETTID) && child_tid_ptr != 0) {
+        mmu_copy_to_guest(vm, child_tid_ptr, &ff->child_pid, sizeof(ff->child_pid));
+    }
+    if (flags & CLONE_CHILD_CLEARTID) {
+        cur->clear_child_tid = child_tid_ptr;
+    }
+    return 0; /* Child returns 0 from fork() / clone() */
+}
+
+typedef struct {
+    uint64_t va;
+    uint8_t  data[PAGE_SIZE];
+} saved_shared_page_t;
+
+static bool handle_fork_child_exit(dethv_vm_t *vm, int exit_code) {
+    if (!vm->fork_saved) return false;
+    fork_frame_t *ff = vm->fork_saved;
+    vm->fork_saved = ff->prev;
+
+    /* Preserve any mapped MAP_SHARED pages written by the child (e.g., fd_sys_util_user_to_uid!) */
+    saved_shared_page_t *spages = NULL;
+    size_t sp_cnt = 0, sp_cap = 0;
+    for (uint32_t i = 0; i < vm->mmu.num_vmas; i++) {
+        vma_t *v = &vm->mmu.vmas[i];
+        if (!(v->flags & MAP_SHARED) || !(v->prot & PROT_WRITE)) continue;
+        if (v->end - v->start > 64ULL * 1024 * 1024) continue;
+        for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE) {
+            uint64_t pa = mmu_virt_to_phys(vm, va, NULL);
+            if (!pa) continue;
+            if (sp_cnt >= sp_cap) {
+                size_t ncap = sp_cap ? sp_cap * 2 : 16;
+                saved_shared_page_t *np = realloc(spages, ncap * sizeof(*spages));
+                if (!np) break;
+                spages = np;
+                sp_cap = ncap;
+            }
+            spages[sp_cnt].va = va;
+            memcpy(spages[sp_cnt].data, vm->mem + (pa & PAGE_MASK), PAGE_SIZE);
+            sp_cnt++;
+        }
+    }
+
+    /* Preserve bytes written by the child into pipes inherited from the parent (POSIX fork semantics) */
+    vpipe_t *saved_pipes = NULL;
+    bool     has_saved_pipe[DETHV_MAX_PIPES];
+    memset(has_saved_pipe, 0, sizeof(has_saved_pipe));
+    if (vm->vfs.pipes && ff->vfs.pipes) {
+        for (int i = 0; i < DETHV_MAX_PIPES; i++) {
+            if (ff->vfs.pipes[i].used && vm->vfs.pipes[i].used) {
+                if (!saved_pipes) saved_pipes = malloc(DETHV_MAX_PIPES * sizeof(vpipe_t));
+                if (!saved_pipes) break;
+                saved_pipes[i]    = vm->vfs.pipes[i];
+                saved_pipes[i].read_closed  = ff->vfs.pipes[i].read_closed;
+                saved_pipes[i].write_closed = ff->vfs.pipes[i].write_closed;
+                has_saved_pipe[i] = true;
+            }
+        }
+    }
+
+    uint64_t saved_vtsc = vm->shared->vtsc;
+    size_t old_next = vm->mmu.next_phys;
+    memcpy(vm->mem, ff->mem, ff->phys_used);
+    if (old_next > ff->phys_used) {
+        memset(vm->mem + ff->phys_used, 0, old_next - ff->phys_used);
+    }
+    vm->mmu   = ff->mmu;
+    vm->sched = ff->sched;
+    vfs_clone(&vm->vfs, &ff->vfs);
+
+    if (vm->vfs.pipes && saved_pipes) {
+        for (int i = 0; i < DETHV_MAX_PIPES; i++) {
+            if (has_saved_pipe[i]) {
+                vm->vfs.pipes[i] = saved_pipes[i];
+                vm->vfs.pipes_dirty = true;
+            }
+        }
+    }
+    free(saved_pipes);
+
+    /* Re-apply child's MAP_SHARED page writes into parent address space */
+    for (size_t i = 0; i < sp_cnt; i++) {
+        mmu_copy_to_guest(vm, spages[i].va, spages[i].data, PAGE_SIZE);
+    }
+    free(spages);
+
+    vm->shared->vtsc          = saved_vtsc;
+    vm->shared->regs          = ff->parent_regs;
+    vm->shared->flush_tlb     = 1;
+    vm->current_fs_base       = ff->current_fs_base;
+    vm->fs_base_dirty         = true;
+    vm->sregs_dirty           = true;
+    vm->sregs_changed_since_snap = true;
+    ioctl(vm->vcpu_fd, KVM_SET_XSAVE, &ff->parent_xsave);
+
+    if (vm->reaped_count < 16) {
+        vm->reaped_pids[vm->reaped_count]     = ff->child_pid;
+        vm->reaped_statuses[vm->reaped_count] = (exit_code & 0xFF) << 8;
+        vm->reaped_count++;
+    }
+
+    vfs_destroy(&ff->vfs);
+    free(ff->mem);
+    free(ff);
+    return true;
 }
 
 /* Helper for sendmsg / sendmmsg */
@@ -71,6 +250,26 @@ static int64_t handle_one_sendmsg(dethv_vm_t *vm, int fd, uint64_t msg_ptr, int 
     if (addrlen > sizeof(addr_buf)) addrlen = sizeof(addr_buf);
     if (msg.msg_name && addrlen > 0) {
         if (mmu_copy_from_guest(vm, addr_buf, (uint64_t)msg.msg_name, addrlen) < 0) return -EFAULT;
+    }
+
+    /* Parse optional IP_PKTINFO cmsg to honor ipi_spec_dst source IP */
+    uint32_t src_ip_override = 0;
+    if (msg.msg_control && msg.msg_controllen >= sizeof(struct cmsghdr) && msg.msg_controllen <= 512) {
+        uint8_t cbuf[512];
+        if (mmu_copy_from_guest(vm, cbuf, (uint64_t)msg.msg_control, msg.msg_controllen) == 0) {
+            struct msghdr hmsg;
+            memset(&hmsg, 0, sizeof(hmsg));
+            hmsg.msg_control    = cbuf;
+            hmsg.msg_controllen = msg.msg_controllen;
+            for (struct cmsghdr *cm = CMSG_FIRSTHDR(&hmsg); cm != NULL; cm = CMSG_NXTHDR(&hmsg, cm)) {
+                if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO &&
+                    cm->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                    struct in_pktinfo pi;
+                    memcpy(&pi, CMSG_DATA(cm), sizeof(pi));
+                    if (pi.ipi_spec_dst.s_addr != 0) src_ip_override = ntohl(pi.ipi_spec_dst.s_addr);
+                }
+            }
+        }
     }
 
     size_t total_len = 0;
@@ -96,8 +295,9 @@ static int64_t handle_one_sendmsg(dethv_vm_t *vm, int fd, uint64_t msg_ptr, int 
         }
     }
 
-    int64_t r = net_sys_sendto(vm, fd, flat, total_len, flags,
-                               (msg.msg_name && addrlen > 0) ? addr_buf : NULL, addrlen);
+    int64_t r = net_sys_sendto_ex(vm, fd, flat, total_len, flags,
+                                  (msg.msg_name && addrlen > 0) ? addr_buf : NULL, addrlen,
+                                  src_ip_override);
     if (flat != sbuf) free(flat);
     return r;
 }
@@ -124,11 +324,13 @@ static int64_t handle_one_recvmsg(dethv_vm_t *vm, int fd, uint64_t msg_ptr, int 
     uint8_t addr_buf[128];
     uint32_t addrlen = msg.msg_namelen;
     if (addrlen > sizeof(addr_buf)) addrlen = sizeof(addr_buf);
+    uint32_t pkt_dst_ip = 0;
 
-    int64_t n = net_sys_recvfrom(vm, fd, flat, total_cap, flags,
-                                 msg.msg_name ? addr_buf : NULL,
-                                 msg.msg_name ? &addrlen : NULL,
-                                 would_block, timeout_ns_out);
+    int64_t n = net_sys_recvfrom_ex(vm, fd, flat, total_cap, flags,
+                                    msg.msg_name ? addr_buf : NULL,
+                                    msg.msg_name ? &addrlen : NULL,
+                                    &pkt_dst_ip,
+                                    would_block, timeout_ns_out);
     if (n >= 0) {
         size_t rem = (size_t)n;
         size_t off = 0;
@@ -146,7 +348,31 @@ static int64_t handle_one_recvmsg(dethv_vm_t *vm, int fd, uint64_t msg_ptr, int 
             mmu_copy_to_guest(vm, (uint64_t)msg.msg_name, addr_buf, wlen);
             msg.msg_namelen = addrlen;
         }
-        msg.msg_controllen = 0;
+        size_t written_ctrl = 0;
+        vfd_t *rf = vfs_get_fd(&vm->vfs, fd);
+        if (rf && rf->kind == FD_SOCKET && vm->net.sockets[rf->ref_idx].recv_pktinfo &&
+            msg.msg_control && msg.msg_controllen >= CMSG_SPACE(sizeof(struct in_pktinfo))) {
+            uint8_t cbuf[128];
+            memset(cbuf, 0, sizeof(cbuf));
+            struct msghdr hmsg;
+            memset(&hmsg, 0, sizeof(hmsg));
+            hmsg.msg_control    = cbuf;
+            hmsg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+            struct cmsghdr *cm = CMSG_FIRSTHDR(&hmsg);
+            cm->cmsg_level = IPPROTO_IP;
+            cm->cmsg_type  = IP_PKTINFO;
+            cm->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
+            struct in_pktinfo pi;
+            memset(&pi, 0, sizeof(pi));
+            uint32_t dip = pkt_dst_ip ? pkt_dst_ip : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
+            pi.ipi_ifindex         = (dip == 0x7F000001U) ? 1 : 2;
+            pi.ipi_spec_dst.s_addr = htonl(dip);
+            pi.ipi_addr.s_addr     = htonl(dip);
+            memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+            written_ctrl = CMSG_SPACE(sizeof(struct in_pktinfo));
+            mmu_copy_to_guest(vm, (uint64_t)msg.msg_control, cbuf, written_ctrl);
+        }
+        msg.msg_controllen = written_ctrl;
         msg.msg_flags = 0;
         mmu_copy_to_guest(vm, msg_ptr, &msg, sizeof(msg));
     }
@@ -308,8 +534,8 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             uint8_t *tmp = (count <= sizeof(sbuf)) ? sbuf : malloc(count);
             if (!tmp) { ret = -ENOMEM; break; }
 
-            if (fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used &&
-                vm->vfs.fds[fd].kind == FD_SOCKET) {
+            vfd_t *rf = vfs_get_fd(&vm->vfs, fd);
+            if (rf && rf->kind == FD_SOCKET) {
                 bool wb = false; uint64_t to_ns = 0;
                 ret = net_sys_recvfrom(vm, fd, tmp, count, 0, NULL, NULL, &wb, &to_ns);
                 if (wb) {
@@ -326,11 +552,11 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
                 }
             } else {
                 ret = vfs_read(vm, fd, tmp, count);
-                if (ret == -EAGAIN && fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used &&
-                    !(vm->vfs.fds[fd].flags & O_NONBLOCK) &&
-                    (vm->vfs.fds[fd].kind == FD_PIPE_READ ||
-                     vm->vfs.fds[fd].kind == FD_EVENTFD ||
-                     vm->vfs.fds[fd].kind == FD_TIMERFD)) {
+                if (ret == -EAGAIN && rf &&
+                    !(rf->flags & O_NONBLOCK) &&
+                    (rf->kind == FD_PIPE_READ ||
+                     rf->kind == FD_EVENTFD ||
+                     rf->kind == FD_TIMERFD)) {
                     if (tmp != sbuf) free(tmp);
                     sched_block_io_current(vm, false, 0);
                     return;
@@ -503,9 +729,17 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
 
         case LINUX_SYS_close_range: {
             unsigned int first = (unsigned int)a1, last = (unsigned int)a2;
-            if (last >= DETHV_MAX_FDS) last = DETHV_MAX_FDS - 1;
-            for (unsigned int i = first; i <= last; i++) {
+            unsigned int low_last = last < DETHV_MAX_FDS ? last : (DETHV_MAX_FDS - 1);
+            for (unsigned int i = first; i <= low_last; i++) {
                 if (vm->vfs.fds[i].used) vfs_close(vm, (int)i);
+            }
+            if (vm->vfs.high_fds) {
+                for (uint32_t i = 0; i < vm->vfs.max_high_fd_used; i++) {
+                    if (vm->vfs.high_fds[i].vfd.used) {
+                        unsigned int fnum = (unsigned int)vm->vfs.high_fds[i].fd_num;
+                        if (fnum >= first && fnum <= last) vfs_close(vm, (int)fnum);
+                    }
+                }
             }
             ret = 0;
             break;
@@ -529,8 +763,9 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
         case LINUX_SYS_fallocate: {
             int fd = (int)a1;
             int64_t end = (int64_t)a3 + (int64_t)a4;
-            if (fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used && vm->vfs.fds[fd].kind == FD_MEM_VFILE) {
-                vfile_t *vf = &vm->vfs.vfiles[vm->vfs.fds[fd].ref_idx];
+            vfd_t *ff = vfs_get_fd(&vm->vfs, fd);
+            if (ff && ff->kind == FD_MEM_VFILE) {
+                vfile_t *vf = &vm->vfs.vfiles[ff->ref_idx];
                 if (end > (int64_t)vf->len) ret = vfs_ftruncate(vm, fd, end);
                 else ret = 0;
             } else {
@@ -606,10 +841,18 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             break;
         }
 
-        case LINUX_SYS_statfs:
-        case LINUX_SYS_fstatfs: {
+        case LINUX_SYS_statfs: {
+            char path[512];
+            if (mmu_read_cstring(vm, a1, path, sizeof(path)) < 0) { ret = -EFAULT; break; }
             struct statfs sf;
-            fill_det_statfs(&sf);
+            fill_det_statfs(&sf, path);
+            ret = (mmu_copy_to_guest(vm, a2, &sf, sizeof(sf)) == 0) ? 0 : -EFAULT;
+            break;
+        }
+        case LINUX_SYS_fstatfs: {
+            vfd_t *ff = vfs_get_fd(&vm->vfs, (int)a1);
+            struct statfs sf;
+            fill_det_statfs(&sf, ff ? ff->path : NULL);
             ret = (mmu_copy_to_guest(vm, a2, &sf, sizeof(sf)) == 0) ? 0 : -EFAULT;
             break;
         }
@@ -638,6 +881,29 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
                 if (n > bufsz) n = bufsz;
                 if (mmu_copy_to_guest(vm, buf, vm->vfs.exe_path, n) < 0) ret = -EFAULT;
                 else ret = (int64_t)n;
+            } else if (strcmp(path, "/proc/self") == 0) {
+                char tmp[32];
+                size_t n = (size_t)snprintf(tmp, sizeof(tmp), "%d", vm->sched.pid);
+                if (n > bufsz) n = bufsz;
+                if (mmu_copy_to_guest(vm, buf, tmp, n) < 0) ret = -EFAULT;
+                else ret = (int64_t)n;
+            } else if (strcmp(path, "/proc/thread-self") == 0) {
+                char tmp[64];
+                size_t n = (size_t)snprintf(tmp, sizeof(tmp), "%d/task/%d", vm->sched.pid, cur->tid);
+                if (n > bufsz) n = bufsz;
+                if (mmu_copy_to_guest(vm, buf, tmp, n) < 0) ret = -EFAULT;
+                else ret = (int64_t)n;
+            } else if (strncmp(path, "/proc/self/fd/", 14) == 0 && path[14] >= '0' && path[14] <= '9') {
+                vfd_t *tf = vfs_get_fd(&vm->vfs, atoi(path + 14));
+                if (!tf) { ret = -ENOENT; }
+                else {
+                    size_t n = strlen(tf->path);
+                    if (n > bufsz) n = bufsz;
+                    if (mmu_copy_to_guest(vm, buf, tf->path, n) < 0) ret = -EFAULT;
+                    else ret = (int64_t)n;
+                }
+            } else if (strncmp(path, "/sys/", 5) == 0) {
+                ret = -ENOENT;
             } else {
                 ret = -EINVAL;
             }
@@ -697,7 +963,8 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             char p1[512], p2[512];
             if (mmu_read_cstring(vm, a2, p1, sizeof(p1)) < 0 ||
                 mmu_read_cstring(vm, a4, p2, sizeof(p2)) < 0) { ret = -EFAULT; break; }
-            ret = vfs_rename(vm, (int)a1, p1, (int)a3, p2);
+            unsigned int rflags = (nr == LINUX_SYS_renameat2) ? (unsigned int)a5 : 0U;
+            ret = vfs_rename_ex(vm, (int)a1, p1, (int)a3, p2, rflags);
             break;
         }
         case LINUX_SYS_link: {
@@ -738,9 +1005,9 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
         }
 
         case LINUX_SYS_fchdir: {
-            int fd = (int)a1;
-            if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) { ret = -EBADF; break; }
-            snprintf(vm->vfs.cwd, sizeof(vm->vfs.cwd), "%s", vm->vfs.fds[fd].path);
+            vfd_t *ff = vfs_get_fd(&vm->vfs, (int)a1);
+            if (!ff) { ret = -EBADF; break; }
+            snprintf(vm->vfs.cwd, sizeof(vm->vfs.cwd), "%s", ff->path);
             vm->vfs.cwd_dirty = true;
             ret = 0;
             break;
@@ -766,8 +1033,8 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
 
         case LINUX_SYS_fcntl: {
             int fd = (int)a1, cmd = (int)a2;
-            if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) { ret = -EBADF; break; }
-            vfd_t *f = &vm->vfs.fds[fd];
+            vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+            if (!f) { ret = -EBADF; break; }
             if (cmd == F_DUPFD) ret = vfs_dup(vm, fd, (int)a3, 0, false);
             else if (cmd == F_DUPFD_CLOEXEC) ret = vfs_dup(vm, fd, (int)a3, O_CLOEXEC, false);
             else if (cmd == F_GETFD) ret = (f->flags & O_CLOEXEC) ? FD_CLOEXEC : 0;
@@ -784,9 +1051,9 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
 
         case LINUX_SYS_fsync:
         case LINUX_SYS_fdatasync: {
-            int fd = (int)a1;
-            if (fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used && vm->vfs.fds[fd].kind == FD_MEM_VFILE) {
-                mmu_sync_vfile_from_vmas(vm, (int32_t)vm->vfs.fds[fd].ref_idx);
+            vfd_t *ff = vfs_get_fd(&vm->vfs, (int)a1);
+            if (ff && ff->kind == FD_MEM_VFILE) {
+                mmu_sync_vfile_from_vmas(vm, (int32_t)ff->ref_idx);
             }
             ret = 0;
             break;
@@ -854,8 +1121,8 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             if (a3 && mmu_copy_from_guest(vm, &alen, a3, 4) < 0) { ret = -EFAULT; break; }
             if (alen > sizeof(abuf)) alen = sizeof(abuf);
             ret = net_sys_accept(vm, fd, a2 ? abuf : NULL, a3 ? &alen : NULL, flags);
-            if (ret == -EAGAIN && fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used &&
-                !(vm->vfs.fds[fd].flags & O_NONBLOCK)) {
+            vfd_t *af = vfs_get_fd(&vm->vfs, fd);
+            if (ret == -EAGAIN && af && !(af->flags & O_NONBLOCK)) {
                 sched_block_io_current(vm, false, 0);
                 return;
             }
@@ -1236,19 +1503,31 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             int64_t  off  = (int64_t)a6;
 
             bool is_anon = (flags & MAP_ANONYMOUS) != 0;
-            if (!is_anon && fd >= 0 && fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used &&
-                vm->vfs.fds[fd].kind == FD_IO_URING) {
+            vfd_t *mf = (!is_anon && fd >= 0) ? vfs_get_fd(&vm->vfs, fd) : NULL;
+            if (mf && mf->kind == FD_IO_URING) {
                 ret = (int64_t)iouring_mmap(vm, fd, addr, len, prot, flags, off);
                 break;
             }
-            uint64_t mapped = mmu_mmap_region(vm, addr, len, prot, flags, !is_anon);
+            uint64_t align = PAGE_SIZE;
+            if ((flags & MAP_HUGETLB) ||
+                (mf && (strstr(mf->path, "/.huge/") != NULL || strstr(mf->path, "/.gigantic/") != NULL)) ||
+                (len >= (2ULL << 20) && (len & ((2ULL << 20) - 1)) == 0)) {
+                align = 2ULL << 20; /* 2 MiB alignment for hugetlbfs / Firedancer shmem */
+            }
+            bool demand_vfile = (!is_anon && mf && mf->kind == FD_MEM_VFILE);
+            if (demand_vfile) {
+                mmu_sync_vfile_from_vmas(vm, (int32_t)mf->ref_idx);
+            }
+            uint64_t mapped = mmu_mmap_region_aligned(vm, addr, len, prot, flags,
+                                                      (!is_anon && !demand_vfile), align);
             if ((int64_t)mapped < 0) { ret = (int64_t)mapped; break; }
 
-            if (!is_anon && fd >= 0) {
-                if (fd < DETHV_MAX_FDS && vm->vfs.fds[fd].used &&
-                    vm->vfs.fds[fd].kind == FD_MEM_VFILE && (flags & MAP_SHARED)) {
-                    mmu_set_vma_vfile(vm, mapped, (int32_t)vm->vfs.fds[fd].ref_idx, (uint64_t)off);
+            if (demand_vfile) {
+                mmu_set_vma_vfile(vm, mapped, (int32_t)mf->ref_idx, (uint64_t)off);
+                if ((prot & PROT_EXEC) && vm->cfg.patch_rdrand && len <= 32ULL * 1024 * 1024) {
+                    x86_scan_and_patch_range(vm, mapped, len);
                 }
+            } else if (!is_anon && fd >= 0) {
                 size_t aligned_len = PAGE_ALIGN_UP(len);
                 uint8_t *tmp = calloc(1, aligned_len);
                 if (!tmp) { ret = -ENOMEM; break; }
@@ -1319,8 +1598,47 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
         case LINUX_SYS_mlock:
         case LINUX_SYS_munlock:
         case LINUX_SYS_membarrier:
+        case LINUX_SYS_mbind:
+        case LINUX_SYS_set_mempolicy:
             ret = 0;
             break;
+
+        case LINUX_SYS_get_mempolicy: {
+            if (a1 != 0) {
+                int mode = 0; /* MPOL_DEFAULT */
+                if (mmu_copy_to_guest(vm, a1, &mode, sizeof(mode)) < 0) { ret = -EFAULT; break; }
+            }
+            if (a2 != 0 && a3 > 0) {
+                uint64_t mask = 1ULL; /* NUMA node 0 */
+                size_t bytes = ((size_t)a3 + 7) / 8;
+                if (bytes > sizeof(mask)) bytes = sizeof(mask);
+                if (mmu_copy_to_guest(vm, a2, &mask, bytes) < 0) { ret = -EFAULT; break; }
+            }
+            ret = 0;
+            break;
+        }
+
+        case LINUX_SYS_move_pages: {
+            /* Report all queried pages as resident on NUMA node 0 */
+            size_t count = (size_t)a2;
+            if (a5 != 0 && count > 0) {
+                if (count > (1ULL << 22)) { ret = -ENOMEM; break; }
+                int zbuf[1024];
+                memset(zbuf, 0, sizeof(zbuf));
+                size_t done = 0;
+                while (done < count) {
+                    size_t batch = count - done;
+                    if (batch > 1024) batch = 1024;
+                    if (mmu_copy_to_guest(vm, a5 + done * sizeof(int), zbuf, batch * sizeof(int)) < 0) {
+                        ret = -EFAULT;
+                        goto done_syscall;
+                    }
+                    done += batch;
+                }
+            }
+            ret = 0;
+            break;
+        }
 
         /* ==================== Deterministic Randomness ==================== */
         case LINUX_SYS_getrandom: {
@@ -1477,8 +1795,43 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             ret = -ENOSYS;
             break;
 
+        case LINUX_SYS_fork:
+        case LINUX_SYS_vfork:
+            ret = handle_sync_fork(vm, 0, 0, 0);
+            break;
+
+        case LINUX_SYS_unshare:
+            ret = 0;
+            break;
+
+        case LINUX_SYS_wait4: {
+            int32_t want_pid = (int32_t)a1;
+            int found = -1;
+            for (uint32_t i = 0; i < vm->reaped_count; i++) {
+                if (want_pid == -1 || want_pid == 0 || vm->reaped_pids[i] == want_pid) {
+                    found = (int)i;
+                    break;
+                }
+            }
+            if (found < 0) { ret = -ECHILD; break; }
+            int32_t cpid = vm->reaped_pids[found];
+            int32_t cst  = vm->reaped_statuses[found];
+            for (uint32_t i = (uint32_t)found + 1; i < vm->reaped_count; i++) {
+                vm->reaped_pids[i - 1]     = vm->reaped_pids[i];
+                vm->reaped_statuses[i - 1] = vm->reaped_statuses[i];
+            }
+            vm->reaped_count--;
+            if (a2 != 0 && mmu_copy_to_guest(vm, a2, &cst, sizeof(cst)) < 0) { ret = -EFAULT; break; }
+            ret = cpid;
+            break;
+        }
+
         case LINUX_SYS_clone:
-            ret = sched_create_thread(vm, a1, a2, a3, a4, a5);
+            if (!(a1 & CLONE_VM)) {
+                ret = handle_sync_fork(vm, a1, a2, a4);
+            } else {
+                ret = sched_create_thread(vm, a1, a2, a3, a4, a5);
+            }
             break;
 
         case LINUX_SYS_clone3: {
@@ -1488,9 +1841,20 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             if (csz > sizeof(cl)) csz = sizeof(cl);
             if (mmu_copy_from_guest(vm, &cl, a1, csz) < 0) { ret = -EFAULT; break; }
             uint64_t stack_top = cl.stack ? (cl.stack + cl.stack_size) : 0;
-            ret = sched_create_thread(vm, cl.flags, stack_top, cl.parent_tid, cl.child_tid, cl.tls);
+            if (!(cl.flags & CLONE_VM)) {
+                ret = handle_sync_fork(vm, cl.flags, stack_top, cl.child_tid);
+            } else {
+                ret = sched_create_thread(vm, cl.flags, stack_top, cl.parent_tid, cl.child_tid, cl.tls);
+            }
             break;
         }
+
+        case LINUX_SYS_pause:
+            cur->state       = THREAD_BLOCKED_SLEEP;
+            cur->has_timeout = false;
+            sched_switch_next(vm, true);
+            switched = true;
+            break;
 
         case LINUX_SYS_futex: {
             uint64_t uaddr = a1;
@@ -1624,6 +1988,23 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             ret = 1000;
             break;
 
+        case LINUX_SYS_setuid:
+        case LINUX_SYS_setgid:
+        case LINUX_SYS_setresuid:
+        case LINUX_SYS_setresgid:
+            ret = 0;
+            break;
+
+        case LINUX_SYS_getresuid:
+        case LINUX_SYS_getresgid: {
+            uint32_t id = 1000;
+            if (a1 && mmu_copy_to_guest(vm, a1, &id, 4) < 0) { ret = -EFAULT; break; }
+            if (a2 && mmu_copy_to_guest(vm, a2, &id, 4) < 0) { ret = -EFAULT; break; }
+            if (a3 && mmu_copy_to_guest(vm, a3, &id, 4) < 0) { ret = -EFAULT; break; }
+            ret = 0;
+            break;
+        }
+
         case LINUX_SYS_uname: {
             struct utsname u;
             memset(&u, 0, sizeof(u));
@@ -1655,7 +2036,8 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
             if (old_ptr != 0) {
                 struct rlimit rl = { 64ULL * 1024 * 1024, 64ULL * 1024 * 1024 };
                 if (resource == RLIMIT_STACK)  { rl.rlim_cur = GUEST_STACK_SIZE; rl.rlim_max = GUEST_STACK_SIZE; }
-                if (resource == RLIMIT_NOFILE) { rl.rlim_cur = 1000000;          rl.rlim_max = 1000000; }
+                if (resource == RLIMIT_NOFILE) { rl.rlim_cur = 1048576;          rl.rlim_max = 1048576; }
+                if (resource == RLIMIT_NICE)   { rl.rlim_cur = 40;               rl.rlim_max = 40; }
                 if (resource == RLIMIT_AS || resource == RLIMIT_DATA || resource == RLIMIT_MEMLOCK) {
                     rl.rlim_cur = RLIM_INFINITY; rl.rlim_max = RLIM_INFINITY;
                 }
@@ -1689,7 +2071,10 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
                 break;
             }
             if (a2 != 0) {
-                uint32_t data[6] = {0};
+                uint32_t data[6] = {
+                    0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU,
+                    0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU
+                };
                 size_t dsz = (hdr.version == 0x19980330U) ? 12 : 24;
                 if (mmu_copy_to_guest(vm, a2, data, dsz) < 0) { ret = -EFAULT; break; }
             }
@@ -1753,10 +2138,18 @@ void dethv_handle_syscall(dethv_vm_t *vm) {
         }
 
         case LINUX_SYS_exit:
+            if (vm->fork_saved && sched_num_alive(&vm->sched) <= 1) {
+                handle_fork_child_exit(vm, (int)(a1 & 0xFF));
+                return;
+            }
             sched_exit_current_thread(vm, (int)(a1 & 0xFF));
             return;
 
         case LINUX_SYS_exit_group:
+            if (vm->fork_saved) {
+                handle_fork_child_exit(vm, (int)(a1 & 0xFF));
+                return;
+            }
             vm->exit_code   = (int)(a1 & 0xFF);
             vm->stop_reason = DETHV_STOP_EXITED;
             vm->running     = false;

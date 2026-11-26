@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
@@ -141,6 +142,7 @@ int dethv_net_inject_udp(dethv_vm_t *vm,
     uint32_t tail = (dst->udp_head + dst->udp_count) % DETHV_UDP_QUEUE_LEN;
     udp_pkt_t *pkt = &dst->udp_q[tail];
     pkt->src_ip   = src_ip;
+    pkt->dst_ip   = dst_ip;
     pkt->src_port = src_port;
     pkt->is_ipv6  = 0;
     pkt->len      = (uint32_t)len;
@@ -333,10 +335,10 @@ uint64_t net_earliest_timer_ns(const dethv_vm_t *vm) {
     return earliest;
 }
 
-/* Unified poll/epoll readiness check for any FD */
-uint32_t net_fd_poll_events(dethv_vm_t *vm, int fd) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return POLLNVAL;
-    vfd_t *f = &vm->vfs.fds[fd];
+/* Unified poll/epoll readiness check for any FD (supports nested epoll up to depth 4) */
+static uint32_t net_fd_poll_events_depth(dethv_vm_t *vm, int fd, int depth) {
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return POLLNVAL;
     uint32_t ev = 0;
 
     switch (f->kind) {
@@ -378,11 +380,28 @@ uint32_t net_fd_poll_events(dethv_vm_t *vm, int fd) {
             }
             break;
         }
+        case FD_EPOLL: {
+            if (depth < 4 && f->ref_idx < DETHV_MAX_EPOLLS && vm->net.epolls[f->ref_idx].used) {
+                vepoll_t *ep = &vm->net.epolls[f->ref_idx];
+                for (uint32_t i = 0; i < ep->num_watches; i++) {
+                    epoll_watch_t *w = &ep->watches[i];
+                    if (!w->used || w->fd == fd) continue;
+                    uint32_t rev = net_fd_poll_events_depth(vm, w->fd, depth + 1);
+                    if (rev & (w->events | EPOLLERR | EPOLLHUP)) {
+                        ev |= EPOLLIN;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
         case FD_SOCKET: {
             vsock_t *s = &vm->net.sockets[f->ref_idx];
             if (!s->used) return POLLNVAL;
             if (s->type == SOCK_DGRAM) {
                 if (s->udp_count > 0) ev |= EPOLLIN;
+                ev |= EPOLLOUT;
+            } else if (s->type == SOCK_RAW) {
                 ev |= EPOLLOUT;
             } else if (s->type == SOCK_STREAM) {
                 if (s->listening) {
@@ -406,6 +425,10 @@ uint32_t net_fd_poll_events(dethv_vm_t *vm, int fd) {
     return ev;
 }
 
+uint32_t net_fd_poll_events(dethv_vm_t *vm, int fd) {
+    return net_fd_poll_events_depth(vm, fd, 0);
+}
+
 int net_sys_socket(dethv_vm_t *vm, int domain, int type, int protocol) {
     int base_type = type & 0xFF;
     if (domain != AF_INET && domain != AF_INET6 && domain != AF_UNIX && domain != AF_NETLINK) {
@@ -414,7 +437,8 @@ int net_sys_socket(dethv_vm_t *vm, int domain, int type, int protocol) {
     if (domain == AF_NETLINK) {
         return -EAFNOSUPPORT; /* Forces libc/Rust to cleanly skip netlink interface enumeration */
     }
-    if (base_type != SOCK_DGRAM && base_type != SOCK_STREAM) {
+    bool is_raw_udp = (domain == AF_INET && base_type == SOCK_RAW && protocol == IPPROTO_UDP);
+    if (base_type != SOCK_DGRAM && base_type != SOCK_STREAM && !is_raw_udp) {
         return -ESOCKTNOSUPPORT;
     }
 
@@ -439,7 +463,7 @@ int net_sys_socket(dethv_vm_t *vm, int domain, int type, int protocol) {
     if (type & SOCK_NONBLOCK) fd_flags |= O_NONBLOCK;
     if (type & SOCK_CLOEXEC)  fd_flags |= O_CLOEXEC;
 
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = (fd < DETHV_MAX_FDS) ? &vm->vfs.fds[fd] : vfs_alloc_exact_fd(&vm->vfs, fd);
     memset(f, 0, sizeof(*f));
     f->used = true;
     f->kind = FD_SOCKET;
@@ -457,8 +481,10 @@ int net_sys_socketpair(dethv_vm_t *vm, int domain, int type, int protocol, int s
     int fd1 = net_sys_socket(vm, domain, type, protocol);
     if (fd1 < 0) { vfs_close(vm, fd0); return fd1; }
 
-    int s0 = (int)vm->vfs.fds[fd0].ref_idx;
-    int s1 = (int)vm->vfs.fds[fd1].ref_idx;
+    vfd_t *f0 = vfs_get_fd(&vm->vfs, fd0);
+    vfd_t *f1 = vfs_get_fd(&vm->vfs, fd1);
+    int s0 = (int)f0->ref_idx;
+    int s1 = (int)f1->ref_idx;
     vm->net.sockets[s0].connected = true;
     vm->net.sockets[s0].peer_sock = s1;
     vm->net.sockets[s1].connected = true;
@@ -469,9 +495,9 @@ int net_sys_socketpair(dethv_vm_t *vm, int domain, int type, int protocol, int s
 }
 
 int net_sys_bind(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     int fam = 0; uint32_t ip = 0; uint16_t port = 0;
     if (!parse_sockaddr(addr, addrlen, &fam, &ip, &port)) return -EINVAL;
 
@@ -498,9 +524,9 @@ int net_sys_bind(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) {
 
 int net_sys_listen(dethv_vm_t *vm, int fd, int backlog) {
     (void)backlog;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
     if (!s->bound) {
         s->bound = true;
@@ -512,9 +538,9 @@ int net_sys_listen(dethv_vm_t *vm, int fd, int backlog) {
 }
 
 int net_sys_connect(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     int fam = 0; uint32_t ip = 0; uint16_t port = 0;
     if (!parse_sockaddr(addr, addrlen, &fam, &ip, &port)) return -EINVAL;
 
@@ -556,7 +582,7 @@ int net_sys_connect(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) 
     srv->local_port = listener->local_port;
     srv->peer_ip    = s->local_ip;
     srv->peer_port  = s->local_port;
-    srv->peer_sock  = (int32_t)vm->vfs.fds[fd].ref_idx;
+    srv->peer_sock  = (int32_t)f->ref_idx;
     srv->stream_buf = malloc(DETHV_STREAM_BUF_SIZE);
     if (!srv->stream_buf) { srv->used = false; return -ENOMEM; }
 
@@ -575,9 +601,9 @@ int net_sys_connect(dethv_vm_t *vm, int fd, const void *addr, uint32_t addrlen) 
 }
 
 int net_sys_accept(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_inout, int flags) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     if (!s->listening) return -EINVAL;
     if (s->accept_count == 0) return -EAGAIN;
 
@@ -595,7 +621,7 @@ int net_sys_accept(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_ino
     if (flags & SOCK_NONBLOCK) fd_flags |= O_NONBLOCK;
     if (flags & SOCK_CLOEXEC)  fd_flags |= O_CLOEXEC;
 
-    vfd_t *nf = &vm->vfs.fds[new_fd];
+    vfd_t *nf = (new_fd < DETHV_MAX_FDS) ? &vm->vfs.fds[new_fd] : vfs_alloc_exact_fd(&vm->vfs, new_fd);
     memset(nf, 0, sizeof(*nf));
     nf->used    = true;
     nf->kind    = FD_SOCKET;
@@ -611,9 +637,9 @@ int net_sys_accept(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_ino
 }
 
 int net_sys_getsockname(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrlen_inout, bool peer) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     if (peer) {
         if (!s->connected) return -ENOTCONN;
         write_sockaddr(s->domain, s->peer_ip, s->peer_port, addr_out, addrlen_inout);
@@ -624,9 +650,9 @@ int net_sys_getsockname(dethv_vm_t *vm, int fd, void *addr_out, uint32_t *addrle
 }
 
 int net_sys_setsockopt(dethv_vm_t *vm, int fd, int level, int optname, const void *optval, uint32_t optlen) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     if (level == SOL_SOCKET) {
         if (optname == SO_RCVTIMEO && optlen >= sizeof(struct timeval)) {
             const struct timeval *tv = (const struct timeval *)optval;
@@ -657,9 +683,9 @@ int net_sys_setsockopt(dethv_vm_t *vm, int fd, int level, int optname, const voi
 }
 
 int net_sys_getsockopt(dethv_vm_t *vm, int fd, int level, int optname, void *optval, uint32_t *optlen_inout) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     int val = 0;
     if (level == SOL_SOCKET) {
         if (optname == SO_ERROR)     val = 0;
@@ -675,9 +701,9 @@ int net_sys_getsockopt(dethv_vm_t *vm, int fd, int level, int optname, void *opt
 }
 
 int net_sys_shutdown(dethv_vm_t *vm, int fd, int how) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
     if (how == SHUT_RD || how == SHUT_RDWR) s->shut_rd = true;
     if (how == SHUT_WR || how == SHUT_RDWR) {
         s->shut_wr = true;
@@ -690,12 +716,74 @@ int net_sys_shutdown(dethv_vm_t *vm, int fd, int how) {
     return 0;
 }
 
-int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags,
-                       const void *dest_addr, uint32_t addrlen) {
+static int64_t deliver_udp_datagram(dethv_vm_t *vm, uint32_t src_ip, uint16_t src_port,
+                                    uint32_t dst_ip, uint16_t dst_port, bool is_ipv6,
+                                    const void *payload, size_t plen, int64_t ret_len) {
+    /* External virtual peer bridge: route UDP packets targeting any peer in peer_ip's /24
+     * subnet (excluding guest_ip) to the host TX queue so multiple mock peers can talk to SUT! */
+    bool is_external_peer = (vm->net.peer_ip != 0) &&
+                            ((dst_ip & 0xFFFFFF00U) == (vm->net.peer_ip & 0xFFFFFF00U)) &&
+                            (dst_ip != vm->net.guest_ip);
+    if (is_external_peer && vm->net.tx_q) {
+        if (vm->net.tx_count < DETHV_NET_TX_QUEUE_LEN) {
+            uint32_t tail = (vm->net.tx_head + vm->net.tx_count) % DETHV_NET_TX_QUEUE_LEN;
+            dethv_udp_pkt_t *tp = &vm->net.tx_q[tail];
+            uint32_t sip = src_ip ? src_ip : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
+            if (sip == 0x7F000001U && vm->net.guest_ip) sip = vm->net.guest_ip;
+            tp->src_ip   = sip;
+            tp->src_port = src_port;
+            tp->dst_ip   = dst_ip;
+            tp->dst_port = dst_port;
+            tp->vmono_ns = vm->det.vmono_ns;
+            size_t copy = plen <= sizeof(tp->data) ? plen : sizeof(tp->data);
+            tp->len = (uint32_t)copy;
+            if (copy > 0) memcpy(tp->data, payload, copy);
+            vm->net.tx_count++;
+        }
+        if (vm->stop_on_net_tx) {
+            vm->running = false;
+            vm->stop_reason = DETHV_STOP_NET_TX;
+        }
+        return ret_len;
+    }
+
+    /* Deliver deterministically to matching bound UDP socket on dst_port */
+    vsock_t *dst = NULL;
+    for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
+        vsock_t *cand = &vm->net.sockets[i];
+        if (cand->used && cand->bound && cand->type == SOCK_DGRAM && cand->local_port == dst_port) {
+            if (cand->local_ip == dst_ip) { dst = cand; break; }
+            if (!dst) dst = cand;
+        }
+    }
+    if (!dst || dst->udp_count >= DETHV_UDP_QUEUE_LEN) {
+        return ret_len;
+    }
+
+    uint32_t tail = (dst->udp_head + dst->udp_count) % DETHV_UDP_QUEUE_LEN;
+    udp_pkt_t *pkt = &dst->udp_q[tail];
+    pkt->src_ip   = src_ip ? src_ip : 0x7F000001U;
+    pkt->dst_ip   = dst_ip ? dst_ip : dst->local_ip;
+    pkt->src_port = src_port;
+    pkt->is_ipv6  = is_ipv6 ? 1 : 0;
+    pkt->len      = (uint32_t)plen;
+    pkt->data     = plen > 0 ? malloc(plen) : NULL;
+    if (plen > 0) {
+        if (!pkt->data) return -ENOMEM;
+        memcpy(pkt->data, payload, plen);
+    }
+    dst->udp_count++;
+    dst->io_gen++;
+    net_wake_io_waiters(vm);
+    return ret_len;
+}
+
+int64_t net_sys_sendto_ex(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags,
+                          const void *dest_addr, uint32_t addrlen, uint32_t src_ip_override) {
     (void)flags;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vsock_t *s = &vm->net.sockets[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
+    vsock_t *s = &vm->net.sockets[f->ref_idx];
 
     if (s->type == SOCK_STREAM) {
         if (!s->connected || s->peer_sock < 0) return -ENOTCONN;
@@ -716,6 +804,22 @@ int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int 
         return (int64_t)n;
     }
 
+    if (s->type == SOCK_RAW && s->protocol == IPPROTO_UDP) {
+        /* Raw UDP socket (Firedancer sock tile TX): 8-byte big-endian UDP header + payload */
+        if (len < 8) return -EINVAL;
+        uint32_t dst_ip = 0;
+        uint16_t ignored_port = 0;
+        int fam = 0;
+        if (!dest_addr || addrlen == 0 || !parse_sockaddr(dest_addr, addrlen, &fam, &dst_ip, &ignored_port))
+            return -EDESTADDRREQ;
+        const uint8_t *b = (const uint8_t *)buf;
+        uint16_t sport = (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
+        uint16_t dport = (uint16_t)(((uint16_t)b[2] << 8) | b[3]);
+        uint32_t src_ip = src_ip_override ? src_ip_override
+                          : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
+        return deliver_udp_datagram(vm, src_ip, sport, dst_ip, dport, false, b + 8, len - 8, (int64_t)len);
+    }
+
     /* UDP sendto */
     if (!s->bound) {
         s->bound = true;
@@ -734,73 +838,25 @@ int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int 
         return -EDESTADDRREQ;
     }
 
-    /* External virtual peer bridge: route UDP packets targeting peer_ip to host TX queue! */
-    if (vm->net.peer_ip != 0 && dst_ip == vm->net.peer_ip && vm->net.tx_q) {
-        if (vm->net.tx_count < DETHV_NET_TX_QUEUE_LEN) {
-            uint32_t tail = (vm->net.tx_head + vm->net.tx_count) % DETHV_NET_TX_QUEUE_LEN;
-            dethv_udp_pkt_t *tp = &vm->net.tx_q[tail];
-            uint32_t src_ip = s->local_ip ? s->local_ip : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
-            if (src_ip == 0x7F000001U && vm->net.guest_ip) src_ip = vm->net.guest_ip;
-            tp->src_ip   = src_ip;
-            tp->src_port = s->local_port;
-            tp->dst_ip   = dst_ip;
-            tp->dst_port = dst_port;
-            tp->vmono_ns = vm->det.vmono_ns;
-            size_t copy = len <= sizeof(tp->data) ? len : sizeof(tp->data);
-            tp->len = (uint32_t)copy;
-            if (copy > 0) memcpy(tp->data, buf, copy);
-            vm->net.tx_count++;
-        }
-        if (vm->stop_on_net_tx) {
-            vm->running = false;
-            vm->stop_reason = DETHV_STOP_NET_TX;
-        }
-        return (int64_t)len;
-    }
-
-    /* Deliver deterministically to matching bound UDP socket(s) on dst_port */
-    vsock_t *dst = NULL;
-    for (int i = 0; i < DETHV_MAX_SOCKETS; i++) {
-        vsock_t *cand = &vm->net.sockets[i];
-        if (cand->used && cand->bound && cand->type == SOCK_DGRAM && cand->local_port == dst_port) {
-            dst = cand;
-            break;
-        }
-    }
-    if (!dst) {
-        /* Standard UDP behavior: silently dropped if nobody listening on port */
-        return (int64_t)len;
-    }
-    if (dst->udp_count >= DETHV_UDP_QUEUE_LEN) {
-        /* Queue full: drop packet deterministically */
-        return (int64_t)len;
-    }
-
-    uint32_t tail = (dst->udp_head + dst->udp_count) % DETHV_UDP_QUEUE_LEN;
-    udp_pkt_t *pkt = &dst->udp_q[tail];
-    pkt->src_ip   = s->local_ip ? s->local_ip : 0x7F000001U;
-    pkt->src_port = s->local_port;
-    pkt->is_ipv6  = (s->domain == AF_INET6) ? 1 : 0;
-    pkt->len      = (uint32_t)len;
-    pkt->data     = len > 0 ? malloc(len) : NULL;
-    if (len > 0) {
-        if (!pkt->data) return -ENOMEM;
-        memcpy(pkt->data, buf, len);
-    }
-    dst->udp_count++;
-    dst->io_gen++;
-    net_wake_io_waiters(vm);
-    return (int64_t)len;
+    uint32_t src_ip = src_ip_override ? src_ip_override : s->local_ip;
+    return deliver_udp_datagram(vm, src_ip, s->local_port, dst_ip, dst_port,
+                                (s->domain == AF_INET6), buf, len, (int64_t)len);
 }
 
-int64_t net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags,
-                         void *src_addr_out, uint32_t *addrlen_inout,
-                         bool *would_block, uint64_t *timeout_ns_out) {
+int64_t net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags,
+                       const void *dest_addr, uint32_t addrlen) {
+    return net_sys_sendto_ex(vm, fd, buf, len, flags, dest_addr, addrlen, 0);
+}
+
+int64_t net_sys_recvfrom_ex(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags,
+                            void *src_addr_out, uint32_t *addrlen_inout,
+                            uint32_t *dst_ip_out,
+                            bool *would_block, uint64_t *timeout_ns_out) {
     *would_block = false;
     *timeout_ns_out = 0;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_SOCKET)
-        return -ENOTSOCK;
-    vfd_t *f = &vm->vfs.fds[fd];
+    if (dst_ip_out) *dst_ip_out = 0;
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_SOCKET) return -ENOTSOCK;
     vsock_t *s = &vm->net.sockets[f->ref_idx];
     bool nonblock = ((f->flags & O_NONBLOCK) != 0) || ((flags & MSG_DONTWAIT) != 0);
 
@@ -833,6 +889,7 @@ int64_t net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flag
         if (src_addr_out && addrlen_inout) {
             write_sockaddr(s->domain, s->peer_ip, s->peer_port, src_addr_out, addrlen_inout);
         }
+        if (dst_ip_out) *dst_ip_out = s->local_ip;
         return (int64_t)n;
     }
 
@@ -850,6 +907,7 @@ int64_t net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flag
     if (src_addr_out && addrlen_inout) {
         write_sockaddr(s->domain, pkt->src_ip, pkt->src_port, src_addr_out, addrlen_inout);
     }
+    if (dst_ip_out) *dst_ip_out = pkt->dst_ip ? pkt->dst_ip : s->local_ip;
     int64_t ret = (flags & MSG_TRUNC) ? (int64_t)pkt->len : (int64_t)copy;
     if (!(flags & MSG_PEEK)) {
         free(pkt->data);
@@ -858,6 +916,12 @@ int64_t net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flag
         s->udp_count--;
     }
     return ret;
+}
+
+int64_t net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags,
+                         void *src_addr_out, uint32_t *addrlen_inout,
+                         bool *would_block, uint64_t *timeout_ns_out) {
+    return net_sys_recvfrom_ex(vm, fd, buf, len, flags, src_addr_out, addrlen_inout, NULL, would_block, timeout_ns_out);
 }
 
 /* ==================== Epoll ==================== */
@@ -875,7 +939,7 @@ int net_sys_epoll_create(dethv_vm_t *vm, int flags) {
     vm->net.epolls[eidx].used = true;
     vm->net.dirty = true;
 
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = (fd < DETHV_MAX_FDS) ? &vm->vfs.fds[fd] : vfs_alloc_exact_fd(&vm->vfs, fd);
     memset(f, 0, sizeof(*f));
     f->used = true;
     f->kind = FD_EPOLL;
@@ -888,10 +952,10 @@ int net_sys_epoll_create(dethv_vm_t *vm, int flags) {
 }
 
 int net_sys_epoll_ctl(dethv_vm_t *vm, int epfd, int op, int fd, uint32_t events, uint64_t data) {
-    if (epfd < 0 || epfd >= DETHV_MAX_FDS || !vm->vfs.fds[epfd].used || vm->vfs.fds[epfd].kind != FD_EPOLL)
-        return -EINVAL;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vepoll_t *ep = &vm->net.epolls[vm->vfs.fds[epfd].ref_idx];
+    vfd_t *ef = vfs_get_fd(&vm->vfs, epfd);
+    if (!ef || ef->kind != FD_EPOLL) return -EINVAL;
+    if (!vfs_get_fd(&vm->vfs, fd)) return -EBADF;
+    vepoll_t *ep = &vm->net.epolls[ef->ref_idx];
 
     int found = -1;
     for (uint32_t i = 0; i < ep->num_watches; i++) {
@@ -929,35 +993,47 @@ int net_sys_epoll_ctl(dethv_vm_t *vm, int epfd, int op, int fd, uint32_t events,
     return -EINVAL;
 }
 
-static uint64_t get_fd_io_gen(const dethv_vm_t *vm, int fd) {
-    const vfd_t *f = &vm->vfs.fds[fd];
+static uint64_t get_fd_io_gen_depth(const dethv_vm_t *vm, int fd, int depth) {
+    const vfd_t *f = vfs_get_fd_const(&vm->vfs, fd);
+    if (!f) return 0;
     switch (f->kind) {
         case FD_SOCKET:     return vm->net.sockets[f->ref_idx].io_gen;
         case FD_PIPE_READ:
         case FD_PIPE_WRITE: return vm->vfs.pipes[f->ref_idx].io_gen;
         case FD_EVENTFD:    return f->io_gen;
         case FD_TIMERFD:    return vm->net.timers[f->ref_idx].next_expire_ns;
+        case FD_EPOLL: {
+            uint64_t g = f->io_gen;
+            if (depth < 4 && f->ref_idx < DETHV_MAX_EPOLLS && vm->net.epolls[f->ref_idx].used) {
+                const vepoll_t *ep = &vm->net.epolls[f->ref_idx];
+                for (uint32_t i = 0; i < ep->num_watches; i++) {
+                    if (ep->watches[i].used && ep->watches[i].fd != fd)
+                        g ^= get_fd_io_gen_depth(vm, ep->watches[i].fd, depth + 1) + (uint64_t)(i + 1);
+                }
+            }
+            return g;
+        }
         default:            return f->io_gen;
     }
 }
 
 int net_sys_epoll_wait(dethv_vm_t *vm, int epfd, uint64_t events_guest_ptr, int maxevents) {
-    if (epfd < 0 || epfd >= DETHV_MAX_FDS || !vm->vfs.fds[epfd].used || vm->vfs.fds[epfd].kind != FD_EPOLL)
-        return -EINVAL;
+    vfd_t *ef = vfs_get_fd(&vm->vfs, epfd);
+    if (!ef || ef->kind != FD_EPOLL) return -EINVAL;
     if (maxevents <= 0) return -EINVAL;
-    vepoll_t *ep = &vm->net.epolls[vm->vfs.fds[epfd].ref_idx];
+    vepoll_t *ep = &vm->net.epolls[ef->ref_idx];
 
     int ready_cnt = 0;
     for (uint32_t i = 0; i < ep->num_watches && ready_cnt < maxevents; i++) {
         epoll_watch_t *w = &ep->watches[i];
         if (!w->used) continue;
-        if (w->fd < 0 || w->fd >= DETHV_MAX_FDS || !vm->vfs.fds[w->fd].used) {
+        if (!vfs_get_fd(&vm->vfs, w->fd)) {
             w->used = false;
             continue;
         }
         uint32_t rev = net_fd_poll_events(vm, w->fd);
         uint32_t matched = rev & (w->events | EPOLLERR | EPOLLHUP);
-        uint64_t gen = get_fd_io_gen(vm, w->fd);
+        uint64_t gen = get_fd_io_gen_depth(vm, w->fd, 0);
 
         if (w->events & EPOLLET) {
             /* Edge-triggered: only report on newly-rising bits or new I/O event generation! */
@@ -1001,7 +1077,7 @@ int net_sys_timerfd_create(dethv_vm_t *vm, int clockid, int flags) {
     vm->net.timers[tidx].clockid = clockid;
     vm->net.dirty = true;
 
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = (fd < DETHV_MAX_FDS) ? &vm->vfs.fds[fd] : vfs_alloc_exact_fd(&vm->vfs, fd);
     memset(f, 0, sizeof(*f));
     f->used = true;
     f->kind = FD_TIMERFD;
@@ -1015,9 +1091,9 @@ int net_sys_timerfd_create(dethv_vm_t *vm, int clockid, int flags) {
 
 int net_sys_timerfd_settime(dethv_vm_t *vm, int fd, int flags, uint64_t new_val_ns, uint64_t interval_ns, bool abs_time) {
     (void)flags;
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_TIMERFD)
-        return -EINVAL;
-    vtimer_t *tm = &vm->net.timers[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_TIMERFD) return -EINVAL;
+    vtimer_t *tm = &vm->net.timers[f->ref_idx];
     if (new_val_ns == 0) {
         tm->next_expire_ns = 0;
         tm->interval_ns = 0;
@@ -1029,9 +1105,9 @@ int net_sys_timerfd_settime(dethv_vm_t *vm, int fd, int flags, uint64_t new_val_
 }
 
 int64_t net_timerfd_read(dethv_vm_t *vm, int fd, uint64_t *exp_out) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used || vm->vfs.fds[fd].kind != FD_TIMERFD)
-        return -EINVAL;
-    vtimer_t *tm = &vm->net.timers[vm->vfs.fds[fd].ref_idx];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f || f->kind != FD_TIMERFD) return -EINVAL;
+    vtimer_t *tm = &vm->net.timers[f->ref_idx];
     if (tm->next_expire_ns == 0 || vm->det.vmono_ns < tm->next_expire_ns)
         return -EAGAIN;
     uint64_t exp = 1;
@@ -1047,8 +1123,8 @@ int64_t net_timerfd_read(dethv_vm_t *vm, int fd, uint64_t *exp_out) {
 }
 
 int net_ioctl(dethv_vm_t *vm, int fd, uint64_t req, uint64_t arg) {
-    if (fd < 0 || fd >= DETHV_MAX_FDS || !vm->vfs.fds[fd].used) return -EBADF;
-    vfd_t *f = &vm->vfs.fds[fd];
+    vfd_t *f = vfs_get_fd(&vm->vfs, fd);
+    if (!f) return -EBADF;
     if (req == FIONBIO) {
         int val = 0;
         if (mmu_copy_from_guest(vm, &val, arg, 4) < 0) return -EFAULT;
@@ -1068,6 +1144,42 @@ int net_ioctl(dethv_vm_t *vm, int fd, uint64_t req, uint64_t arg) {
             avail = (int)vm->vfs.pipes[f->ref_idx].count;
         }
         return (mmu_copy_to_guest(vm, arg, &avail, 4) == 0) ? 0 : -EFAULT;
+    }
+    if (req == SIOCGIFINDEX || req == SIOCGIFADDR || req == SIOCGIFNAME ||
+        req == SIOCGIFMTU || req == SIOCGIFFLAGS || req == SIOCGIFHWADDR) {
+        struct ifreq ifr;
+        if (mmu_copy_from_guest(vm, &ifr, arg, sizeof(ifr)) < 0) return -EFAULT;
+        if (req == SIOCGIFNAME) {
+            if (ifr.ifr_ifindex == 1)      snprintf(ifr.ifr_name, IFNAMSIZ, "lo");
+            else if (ifr.ifr_ifindex == 2) snprintf(ifr.ifr_name, IFNAMSIZ, "eth0");
+            else return -ENODEV;
+            return (mmu_copy_to_guest(vm, arg, &ifr, sizeof(ifr)) == 0) ? 0 : -EFAULT;
+        }
+        bool is_lo = (strcmp(ifr.ifr_name, "lo") == 0);
+        bool is_eth0 = (strcmp(ifr.ifr_name, "eth0") == 0);
+        if (!is_lo && !is_eth0) return -ENODEV;
+        if (req == SIOCGIFINDEX) {
+            ifr.ifr_ifindex = is_lo ? 1 : 2;
+        } else if (req == SIOCGIFADDR) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            uint32_t ip = is_lo ? 0x7F000001U : (vm->net.guest_ip ? vm->net.guest_ip : 0x7F000001U);
+            sin.sin_addr.s_addr = htonl(ip);
+            memcpy(&ifr.ifr_addr, &sin, sizeof(sin));
+        } else if (req == SIOCGIFMTU) {
+            ifr.ifr_mtu = is_lo ? 65536 : 1500;
+        } else if (req == SIOCGIFFLAGS) {
+            ifr.ifr_flags = (short)(IFF_UP | IFF_RUNNING | (is_lo ? IFF_LOOPBACK : (IFF_BROADCAST | IFF_MULTICAST)));
+        } else if (req == SIOCGIFHWADDR) {
+            memset(&ifr.ifr_hwaddr, 0, sizeof(ifr.ifr_hwaddr));
+            ifr.ifr_hwaddr.sa_family = 1; /* ARPHRD_ETHER */
+            if (!is_lo) {
+                uint8_t mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 };
+                memcpy(ifr.ifr_hwaddr.sa_data, mac, 6);
+            }
+        }
+        return (mmu_copy_to_guest(vm, arg, &ifr, sizeof(ifr)) == 0) ? 0 : -EFAULT;
     }
     return -ENOTTY;
 }

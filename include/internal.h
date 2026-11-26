@@ -29,7 +29,15 @@
 #define DETHV_MAX_VMAS          8192
 #define DETHV_MAX_THREADS       512
 #define DETHV_MAX_FDS           2048
+#define DETHV_MAX_HIGH_FDS      256
+#define DETHV_MAX_FD_NUM        1048576
 #define DETHV_MAX_VFILES        4096
+
+/* Sparse vfile backing for large files (hugetlbfs workspaces, accounts.db, etc.) */
+#define VFILE_SPARSE_THRESHOLD  (4ULL * 1024 * 1024)          /* 4 MiB */
+#define VFILE_SPARSE_MAX_SIZE   (128ULL * 1024 * 1024 * 1024) /* 128 GiB */
+#define VFILE_L1_SLOTS          32768                         /* 32768 * 1024 * 4KB = 128 GiB */
+#define VFILE_L2_SLOTS          1024
 #define DETHV_MAX_PIPES         128
 #define DETHV_MAX_SOCKETS       512
 #define DETHV_MAX_EPOLLS        64
@@ -108,6 +116,7 @@ int      mmu_unmap_page(dethv_vm_t *vm, uint64_t vaddr);
 int      mmu_protect_page(dethv_vm_t *vm, uint64_t vaddr, uint64_t pte_flags);
 uint64_t mmu_virt_to_phys(const dethv_vm_t *vm, uint64_t vaddr, uint64_t *pte_out);
 uint64_t mmu_mmap_region(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, bool populate);
+uint64_t mmu_mmap_region_aligned(dethv_vm_t *vm, uint64_t hint, size_t len, uint32_t prot, uint32_t flags, bool populate, uint64_t align);
 void     mmu_set_vma_vfile(dethv_vm_t *vm, uint64_t start, int32_t vfile_idx, uint64_t file_off);
 void     mmu_sync_vfile_from_vmas(dethv_vm_t *vm, int32_t vfile_idx);
 void     mmu_sync_all_shared_vmas_in_range(dethv_vm_t *vm, uint64_t start, uint64_t end);
@@ -207,14 +216,21 @@ typedef struct {
 } vfd_t;
 
 typedef struct {
-    bool     used;
-    bool     is_dir;
-    char     path[512];
-    uint32_t mode;
-    size_t   len;
-    size_t   cap;
-    uint8_t *data;
+    bool       used;
+    bool       is_dir;
+    bool       sparse;
+    char       path[512];
+    uint32_t   mode;
+    size_t     len;
+    size_t     cap;
+    uint8_t   *data;
+    uint8_t ***l1_pages;        /* Sparse 2-level 4KB page table [VFILE_L1_SLOTS][VFILE_L2_SLOTS] */
 } vfile_t;
+
+typedef struct {
+    int   fd_num;
+    vfd_t vfd;
+} high_vfd_t;
 
 typedef struct {
     bool     used;
@@ -228,60 +244,71 @@ typedef struct {
 } vpipe_t;
 
 typedef struct {
-    vfd_t    fds[DETHV_MAX_FDS];
-    vpipe_t *pipes;             /* Heap-allocated [DETHV_MAX_PIPES] */
-    uint32_t max_fd_used;
-    uint8_t *stdin_buf;
-    size_t   stdin_len;
-    size_t   stdin_cap;
-    size_t   stdin_pos;
-    uint8_t *stdout_buf;
-    size_t   stdout_len;
-    uint8_t *stderr_buf;
-    size_t   stderr_len;
-    vfile_t *vfiles;            /* Heap-allocated [DETHV_MAX_VFILES] */
-    uint32_t max_vfile_used;
-    char     cwd[512];
-    char     exe_path[512];
-    uint32_t umask_val;
-    bool     fds_dirty;
-    bool     pipes_dirty;
-    bool     vfiles_dirty;
-    bool     cwd_dirty;
+    vfd_t       fds[DETHV_MAX_FDS];
+    high_vfd_t *high_fds;       /* Heap-allocated [DETHV_MAX_HIGH_FDS] for FDs >= DETHV_MAX_FDS */
+    uint32_t    max_high_fd_used;
+    vpipe_t    *pipes;          /* Heap-allocated [DETHV_MAX_PIPES] */
+    uint32_t    max_fd_used;
+    uint8_t    *stdin_buf;
+    size_t      stdin_len;
+    size_t      stdin_cap;
+    size_t      stdin_pos;
+    uint8_t    *stdout_buf;
+    size_t      stdout_len;
+    uint8_t    *stderr_buf;
+    size_t      stderr_len;
+    vfile_t    *vfiles;         /* Heap-allocated [DETHV_MAX_VFILES] */
+    uint32_t    max_vfile_used;
+    char        cwd[512];
+    char        exe_path[512];
+    uint32_t    umask_val;
+    bool        fds_dirty;
+    bool        pipes_dirty;
+    bool        vfiles_dirty;
+    bool        cwd_dirty;
 } vfs_state_t;
 
-int     vfs_init(dethv_vm_t *vm);
-void    vfs_destroy(vfs_state_t *vfs);
-int     vfs_clone(vfs_state_t *dst, const vfs_state_t *src);
-int     vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src);
-void    vfs_resolve_path(const vfs_state_t *vfs, int dirfd, const char *path, char *out, size_t out_sz);
-int     vfs_alloc_fd(vfs_state_t *vfs, int min_fd);
-int     vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t mode);
-int64_t vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count);
-int64_t vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count);
-int64_t vfs_pread(dethv_vm_t *vm, int fd, void *buf, size_t count, int64_t off);
-int64_t vfs_pwrite(dethv_vm_t *vm, int fd, const void *buf, size_t count, int64_t off);
-int64_t vfs_lseek(dethv_vm_t *vm, int fd, int64_t off, int whence);
-int     vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length);
-int     vfs_truncate_path(dethv_vm_t *vm, const char *path, int64_t length);
-int     vfs_close(dethv_vm_t *vm, int fd);
-int     vfs_dup(dethv_vm_t *vm, int oldfd, int newfd, int flags, bool exact);
-int     vfs_fstat(dethv_vm_t *vm, int fd, void *statbuf_out);
-int     vfs_stat_path(dethv_vm_t *vm, int dirfd, const char *path, void *statbuf_out, int flags);
-int     vfs_mkdir(dethv_vm_t *vm, int dirfd, const char *path, uint32_t mode);
-int     vfs_rmdir(dethv_vm_t *vm, int dirfd, const char *path);
-int     vfs_unlink(dethv_vm_t *vm, int dirfd, const char *path, int flags);
-int     vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
-int     vfs_link(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
-int64_t vfs_getdents64(dethv_vm_t *vm, int fd, void *buf, size_t count);
-int     vfs_pipe(dethv_vm_t *vm, int fds_out[2], int flags);
-int     vfs_eventfd(dethv_vm_t *vm, uint64_t initval, int flags);
-int     vfs_set_vfile_data(vfs_state_t *vfs, const char *path, const void *data, size_t len);
+int          vfs_init(dethv_vm_t *vm);
+void         vfs_destroy(vfs_state_t *vfs);
+int          vfs_clone(vfs_state_t *dst, const vfs_state_t *src);
+int          vfs_restore_fast(vfs_state_t *dst, const vfs_state_t *src);
+vfd_t       *vfs_get_fd(vfs_state_t *vfs, int fd);
+const vfd_t *vfs_get_fd_const(const vfs_state_t *vfs, int fd);
+vfd_t       *vfs_alloc_exact_fd(vfs_state_t *vfs, int fd);
+void         vfs_resolve_path(const vfs_state_t *vfs, int dirfd, const char *path, char *out, size_t out_sz);
+int          vfs_alloc_fd(vfs_state_t *vfs, int min_fd);
+int          vfs_openat(dethv_vm_t *vm, int dirfd, const char *path, int flags, uint32_t mode);
+int64_t      vfs_read(dethv_vm_t *vm, int fd, void *buf, size_t count);
+int64_t      vfs_write(dethv_vm_t *vm, int fd, const void *buf, size_t count);
+int64_t      vfs_pread(dethv_vm_t *vm, int fd, void *buf, size_t count, int64_t off);
+int64_t      vfs_pwrite(dethv_vm_t *vm, int fd, const void *buf, size_t count, int64_t off);
+int64_t      vfs_lseek(dethv_vm_t *vm, int fd, int64_t off, int whence);
+int          vfs_ftruncate(dethv_vm_t *vm, int fd, int64_t length);
+int          vfs_truncate_path(dethv_vm_t *vm, const char *path, int64_t length);
+int          vfs_close(dethv_vm_t *vm, int fd);
+int          vfs_dup(dethv_vm_t *vm, int oldfd, int newfd, int flags, bool exact);
+int          vfs_fstat(dethv_vm_t *vm, int fd, void *statbuf_out);
+int          vfs_stat_path(dethv_vm_t *vm, int dirfd, const char *path, void *statbuf_out, int flags);
+int          vfs_mkdir(dethv_vm_t *vm, int dirfd, const char *path, uint32_t mode);
+int          vfs_rmdir(dethv_vm_t *vm, int dirfd, const char *path);
+int          vfs_unlink(dethv_vm_t *vm, int dirfd, const char *path, int flags);
+int          vfs_rename(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
+int          vfs_rename_ex(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags);
+int          vfs_link(dethv_vm_t *vm, int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
+int64_t      vfs_getdents64(dethv_vm_t *vm, int fd, void *buf, size_t count);
+int          vfs_pipe(dethv_vm_t *vm, int fds_out[2], int flags);
+int          vfs_eventfd(dethv_vm_t *vm, uint64_t initval, int flags);
+int          vfs_set_vfile_data(vfs_state_t *vfs, const char *path, const void *data, size_t len);
+void         vfile_free_sparse(vfile_t *vf);
+int          vfile_clone_sparse(vfile_t *dst, const vfile_t *src);
+bool         vfile_read_page(const vfile_t *vf, uint64_t page_off, void *dst_4k);
+int          vfile_write_page(vfile_t *vf, uint64_t page_off, const void *src_4k, size_t valid_bytes);
 
 /* ================= Deterministic Virtual Loopback Network, Epoll & TimerFD ================= */
 
 typedef struct {
-    uint32_t src_ip;            /* IPv4 network byte order (or 127.0.0.1) */
+    uint32_t src_ip;            /* IPv4 host byte order */
+    uint32_t dst_ip;            /* IPv4 host byte order (for IP_PKTINFO) */
     uint16_t src_port;          /* Host byte order */
     uint8_t  is_ipv6;
     uint32_t len;
@@ -388,7 +415,9 @@ int      net_sys_setsockopt(dethv_vm_t *vm, int fd, int level, int optname, cons
 int      net_sys_getsockopt(dethv_vm_t *vm, int fd, int level, int optname, void *optval, uint32_t *optlen_inout);
 int      net_sys_shutdown(dethv_vm_t *vm, int fd, int how);
 int64_t  net_sys_sendto(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags, const void *dest_addr, uint32_t addrlen);
+int64_t  net_sys_sendto_ex(dethv_vm_t *vm, int fd, const void *buf, size_t len, int flags, const void *dest_addr, uint32_t addrlen, uint32_t src_ip_override);
 int64_t  net_sys_recvfrom(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags, void *src_addr_out, uint32_t *addrlen_inout, bool *would_block, uint64_t *timeout_ns_out);
+int64_t  net_sys_recvfrom_ex(dethv_vm_t *vm, int fd, void *buf, size_t len, int flags, void *src_addr_out, uint32_t *addrlen_inout, uint32_t *dst_ip_out, bool *would_block, uint64_t *timeout_ns_out);
 int      net_sys_epoll_create(dethv_vm_t *vm, int flags);
 int      net_sys_epoll_ctl(dethv_vm_t *vm, int epfd, int op, int fd, uint32_t events, uint64_t data);
 int      net_sys_epoll_wait(dethv_vm_t *vm, int epfd, uint64_t events_guest_ptr, int maxevents);
@@ -497,6 +526,23 @@ void     sched_account_pmu(dethv_vm_t *vm);
 bool     sched_wake_expired_timers(dethv_vm_t *vm);
 bool     sched_ensure_runnable(dethv_vm_t *vm);
 
+/* Saved parent state for synchronous single-child fork() emulation (e.g. getpwnam helper) */
+typedef struct fork_frame {
+    struct fork_frame *prev;
+    int32_t            parent_pid;
+    int32_t            child_pid;
+    size_t             phys_used;
+    uint8_t           *mem;
+    mmu_state_t        mmu;
+    sched_state_t      sched;
+    vfs_state_t        vfs;
+    uint64_t           current_fs_base;
+    user_regs_t        parent_regs;
+    struct kvm_xsave   parent_xsave;
+} fork_frame_t;
+
+void fork_free_all(dethv_vm_t *vm);
+
 /* ================= Main Hypervisor VM Struct ================= */
 
 struct dethv_vm {
@@ -580,6 +626,12 @@ struct dethv_vm {
     bool                   stop_on_net_tx;
     dethv_output_cb_t      output_cb;
     void                  *output_cb_ctx;
+
+    /* Synchronous fork() child state */
+    fork_frame_t          *fork_saved;
+    int32_t                reaped_pids[16];
+    int32_t                reaped_statuses[16];
+    uint32_t               reaped_count;
 
     /* Run status */
     bool                   running;

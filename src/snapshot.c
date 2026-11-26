@@ -5,7 +5,7 @@
 #include <sys/ioctl.h>
 
 #define DETHV_SNAP_MAGIC   0x53564844U /* "DHVS" */
-#define DETHV_SNAP_VERSION 3U
+#define DETHV_SNAP_VERSION 4U
 
 static uint64_t g_next_snap_id = 1;
 
@@ -428,6 +428,8 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
 
     if (write_all(fp, &snap->vfs.max_fd_used, sizeof(snap->vfs.max_fd_used)) ||
         write_all(fp, snap->vfs.fds, snap->vfs.max_fd_used * sizeof(vfd_t)) ||
+        write_all(fp, &snap->vfs.max_high_fd_used, sizeof(snap->vfs.max_high_fd_used)) ||
+        (snap->vfs.max_high_fd_used > 0 && write_all(fp, snap->vfs.high_fds, snap->vfs.max_high_fd_used * sizeof(high_vfd_t))) ||
         write_all(fp, snap->vfs.cwd, sizeof(snap->vfs.cwd)) ||
         write_all(fp, snap->vfs.exe_path, sizeof(snap->vfs.exe_path)) ||
         write_all(fp, &snap->vfs.umask_val, sizeof(snap->vfs.umask_val)) ||
@@ -449,13 +451,45 @@ int dethv_snapshot_save_file(const dethv_snapshot_t *snap, const char *path) {
         if (write_all(fp, &used, 1)) { fclose(fp); return -1; }
         if (used) {
             uint8_t is_dir = vf->is_dir ? 1 : 0;
+            uint8_t is_sparse = vf->sparse ? 1 : 0;
             if (write_all(fp, &is_dir, 1) ||
+                write_all(fp, &is_sparse, 1) ||
                 write_all(fp, vf->path, sizeof(vf->path)) ||
                 write_all(fp, &vf->mode, sizeof(vf->mode)) ||
-                write_all(fp, &vf->len, sizeof(vf->len)) ||
-                write_all(fp, vf->data, vf->len)) {
+                write_all(fp, &vf->len, sizeof(vf->len))) {
                 fclose(fp);
                 return -1;
+            }
+            if (is_sparse) {
+                uint32_t num_pages = 0;
+                if (vf->l1_pages) {
+                    for (uint32_t l1 = 0; l1 < VFILE_L1_SLOTS; l1++) {
+                        if (!vf->l1_pages[l1]) continue;
+                        for (uint32_t l2 = 0; l2 < VFILE_L2_SLOTS; l2++) {
+                            if (vf->l1_pages[l1][l2]) num_pages++;
+                        }
+                    }
+                }
+                if (write_all(fp, &num_pages, sizeof(num_pages))) { fclose(fp); return -1; }
+                if (vf->l1_pages && num_pages > 0) {
+                    for (uint32_t l1 = 0; l1 < VFILE_L1_SLOTS; l1++) {
+                        if (!vf->l1_pages[l1]) continue;
+                        for (uint32_t l2 = 0; l2 < VFILE_L2_SLOTS; l2++) {
+                            if (!vf->l1_pages[l1][l2]) continue;
+                            uint32_t pidx = l1 * VFILE_L2_SLOTS + l2;
+                            if (write_all(fp, &pidx, sizeof(pidx)) ||
+                                write_all(fp, vf->l1_pages[l1][l2], PAGE_SIZE)) {
+                                fclose(fp);
+                                return -1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (write_all(fp, vf->data, vf->len)) {
+                    fclose(fp);
+                    return -1;
+                }
             }
         }
     }
@@ -563,17 +597,21 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
     }
     x86_patch_rebuild_ht(&snap->patches);
 
-    snap->vfs.pipes      = calloc(DETHV_MAX_PIPES,  sizeof(vpipe_t));
-    snap->vfs.vfiles     = calloc(DETHV_MAX_VFILES, sizeof(vfile_t));
+    snap->vfs.high_fds   = calloc(DETHV_MAX_HIGH_FDS, sizeof(high_vfd_t));
+    snap->vfs.pipes      = calloc(DETHV_MAX_PIPES,    sizeof(vpipe_t));
+    snap->vfs.vfiles     = calloc(DETHV_MAX_VFILES,   sizeof(vfile_t));
     snap->vfs.stdout_buf = calloc(1, DETHV_OUT_CAP);
     snap->vfs.stderr_buf = calloc(1, DETHV_OUT_CAP);
-    if (!snap->vfs.pipes || !snap->vfs.vfiles || !snap->vfs.stdout_buf || !snap->vfs.stderr_buf) {
+    if (!snap->vfs.high_fds || !snap->vfs.pipes || !snap->vfs.vfiles || !snap->vfs.stdout_buf || !snap->vfs.stderr_buf) {
         fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
 
     if (read_all(fp, &snap->vfs.max_fd_used, sizeof(snap->vfs.max_fd_used)) ||
         snap->vfs.max_fd_used > DETHV_MAX_FDS ||
         read_all(fp, snap->vfs.fds, snap->vfs.max_fd_used * sizeof(vfd_t)) ||
+        read_all(fp, &snap->vfs.max_high_fd_used, sizeof(snap->vfs.max_high_fd_used)) ||
+        snap->vfs.max_high_fd_used > DETHV_MAX_HIGH_FDS ||
+        (snap->vfs.max_high_fd_used > 0 && read_all(fp, snap->vfs.high_fds, snap->vfs.max_high_fd_used * sizeof(high_vfd_t))) ||
         read_all(fp, snap->vfs.cwd, sizeof(snap->vfs.cwd)) ||
         read_all(fp, snap->vfs.exe_path, sizeof(snap->vfs.exe_path)) ||
         read_all(fp, &snap->vfs.umask_val, sizeof(snap->vfs.umask_val)) ||
@@ -582,6 +620,7 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
         fclose(fp); dethv_snapshot_free(snap); return NULL;
     }
     for (int i = 0; i < DETHV_MAX_FDS; i++) snap->vfs.fds[i].host_fd = -1;
+    for (int i = 0; i < DETHV_MAX_HIGH_FDS; i++) snap->vfs.high_fds[i].vfd.host_fd = -1;
 
     if (snap->vfs.stdin_len > 0) {
         snap->vfs.stdin_buf = malloc(snap->vfs.stdin_len);
@@ -607,15 +646,41 @@ dethv_snapshot_t *dethv_snapshot_load_file(const char *path) {
         if (used) {
             vfile_t *vf = &snap->vfs.vfiles[i];
             vf->used = true;
-            uint8_t is_dir = 0;
+            uint8_t is_dir = 0, is_sparse = 0;
             if (read_all(fp, &is_dir, 1) ||
+                read_all(fp, &is_sparse, 1) ||
                 read_all(fp, vf->path, sizeof(vf->path)) ||
                 read_all(fp, &vf->mode, sizeof(vf->mode)) ||
                 read_all(fp, &vf->len, sizeof(vf->len))) {
                 fclose(fp); dethv_snapshot_free(snap); return NULL;
             }
             vf->is_dir = (is_dir != 0);
-            if (vf->len > 0) {
+            vf->sparse = (is_sparse != 0);
+            if (vf->sparse) {
+                uint32_t num_pages = 0;
+                if (read_all(fp, &num_pages, sizeof(num_pages))) {
+                    fclose(fp); dethv_snapshot_free(snap); return NULL;
+                }
+                if (num_pages > 0) {
+                    vf->l1_pages = calloc(VFILE_L1_SLOTS, sizeof(uint8_t **));
+                    if (!vf->l1_pages) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+                    for (uint32_t p = 0; p < num_pages; p++) {
+                        uint32_t pidx = 0;
+                        if (read_all(fp, &pidx, sizeof(pidx))) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+                        uint32_t l1 = pidx / VFILE_L2_SLOTS;
+                        uint32_t l2 = pidx % VFILE_L2_SLOTS;
+                        if (l1 >= VFILE_L1_SLOTS) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+                        if (!vf->l1_pages[l1]) {
+                            vf->l1_pages[l1] = calloc(VFILE_L2_SLOTS, sizeof(uint8_t *));
+                            if (!vf->l1_pages[l1]) { fclose(fp); dethv_snapshot_free(snap); return NULL; }
+                        }
+                        vf->l1_pages[l1][l2] = malloc(PAGE_SIZE);
+                        if (!vf->l1_pages[l1][l2] || read_all(fp, vf->l1_pages[l1][l2], PAGE_SIZE)) {
+                            fclose(fp); dethv_snapshot_free(snap); return NULL;
+                        }
+                    }
+                }
+            } else if (vf->len > 0) {
                 vf->data = malloc(vf->len);
                 vf->cap = vf->len;
                 if (!vf->data || read_all(fp, vf->data, vf->len)) {

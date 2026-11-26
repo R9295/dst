@@ -61,6 +61,7 @@
 #define LINUX_SYS_fork                  57
 #define LINUX_SYS_vfork                 58
 #define LINUX_SYS_exit                  60
+#define LINUX_SYS_wait4                 61
 #define LINUX_SYS_uname                 63
 #define LINUX_SYS_fcntl                 72
 #define LINUX_SYS_flock                 73
@@ -102,6 +103,10 @@
 #define LINUX_SYS_getpgrp               111
 #define LINUX_SYS_setsid                112
 #define LINUX_SYS_getgroups             115
+#define LINUX_SYS_setresuid             117
+#define LINUX_SYS_getresuid             118
+#define LINUX_SYS_setresgid             119
+#define LINUX_SYS_getresgid             120
 #define LINUX_SYS_capget                125
 #define LINUX_SYS_capset                126
 #define LINUX_SYS_sigaltstack           131
@@ -137,6 +142,9 @@
 #define LINUX_SYS_epoll_wait            232
 #define LINUX_SYS_epoll_ctl             233
 #define LINUX_SYS_tgkill                234
+#define LINUX_SYS_mbind                 237
+#define LINUX_SYS_set_mempolicy         238
+#define LINUX_SYS_get_mempolicy         239
 #define LINUX_SYS_openat                257
 #define LINUX_SYS_mkdirat               258
 #define LINUX_SYS_newfstatat            262
@@ -149,9 +157,11 @@
 #define LINUX_SYS_faccessat             269
 #define LINUX_SYS_pselect6              270
 #define LINUX_SYS_ppoll                 271
+#define LINUX_SYS_unshare               272
 #define LINUX_SYS_set_robust_list       273
 #define LINUX_SYS_get_robust_list       274
 #define LINUX_SYS_sync_file_range       277
+#define LINUX_SYS_move_pages            279
 #define LINUX_SYS_utimensat             280
 #define LINUX_SYS_epoll_pwait           281
 #define LINUX_SYS_timerfd_create        283
